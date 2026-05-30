@@ -1,4 +1,4 @@
-# Motor GUI
+# Motor Test GUI
 
 Motor GUI for motor control, monitoring, tuning, and IMU visualization.
 
