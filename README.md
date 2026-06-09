@@ -31,24 +31,22 @@ Motor GUI for motor control, monitoring, tuning, and IMU visualization.
 ## Project Files
 
 - `motor_gui.py` — main GUI application
-- `run-2.bat`
-- `run-3.sh`
+- `run.bat`
+- `run.sh`
 
 
 ## Installation
 
-### Option 1: Quick start with script
-
-For Linux/macOS:
+### Option 1: Linux/macOS
 
 ```bash
-bash run-3.sh
+sh ./run.sh
 ```
 
-### Option 2: Smart launcher
+### Option 2: Win
 
 ```bash
-bash run-2.bat
+bash run.bat
 ```
 
 ## Main Interface
