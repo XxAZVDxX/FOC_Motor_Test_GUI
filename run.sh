@@ -44,4 +44,4 @@ fi
 # 运行 GUI
 echo
 echo "Starting Motor GUI..."
-python motor_gui.py
+python main.py

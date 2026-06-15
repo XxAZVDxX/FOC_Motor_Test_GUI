@@ -6,6 +6,7 @@ import sys
 import struct
 import queue
 import time
+import json
 from collections import deque
 from datetime import datetime
 import numpy as np
@@ -171,6 +172,7 @@ class SerialBackend(CommBackend):
 
         buffer = bytearray()
         while self.running:
+            # 发送队列
             try:
                 while True:
                     pkt = self.tx_queue.get_nowait()
@@ -186,20 +188,32 @@ class SerialBackend(CommBackend):
             except queue.Empty:
                 pass
 
+            # 接收数据
             try:
                 read_data = self.serial.read(1)
                 if read_data:
                     buffer.extend(read_data)
                     self.raw_data_received.emit(read_data)
+                    # 帧同步
                     while len(buffer) >= PACKAGE_SIZE:
-                        if buffer[0] == HEAD:
-                            if buffer[PACKAGE_SIZE-1] == TAIL:
-                                packet = CommandPacket.parse(buffer[:PACKAGE_SIZE])
-                                if packet:
-                                    self.packet_received.emit(packet)
-                                buffer = buffer[PACKAGE_SIZE:]
-                            else:
-                                buffer = buffer[1:]
+                        head_idx = -1
+                        for i in range(len(buffer) - PACKAGE_SIZE + 1):
+                            if buffer[i] == HEAD:
+                                head_idx = i
+                                break
+                        if head_idx == -1:
+                            buffer.clear()
+                            break
+                        if head_idx > 0:
+                            buffer = buffer[head_idx:]
+                        if len(buffer) < PACKAGE_SIZE:
+                            break
+                        if buffer[PACKAGE_SIZE-1] == TAIL:
+                            packet_data = buffer[:PACKAGE_SIZE]
+                            packet = CommandPacket.parse(packet_data)
+                            if packet:
+                                self.packet_received.emit(packet)
+                            buffer = buffer[PACKAGE_SIZE:]
                         else:
                             buffer = buffer[1:]
             except Exception as e:
@@ -428,14 +442,10 @@ class IMU3DWidget(GLViewWidget):
             self.current_mesh_item = GLMeshItem(meshdata=meshdata, smooth=True, drawEdges=False)
             self.addItem(self.current_mesh_item)
 
-            # --- 修复相机位置 ---
-            bounds = mesh.bounds  # (min_point, max_point)
+            bounds = mesh.bounds
             center = (bounds[0] + bounds[1]) / 2.0
-            # 转换为 pyqtgraph 可接受的对象
             center_vec = pg.Vector(center[0], center[1], center[2])
-            # 模型尺寸
             size = bounds[1] - bounds[0]
-            # 取最大轴的长度，乘系数作为相机距离
             distance = max(size) * 2.0
             self.setCameraPosition(distance=distance, pos=center_vec)
             return True
@@ -509,6 +519,11 @@ class MotorGUI(QMainWindow):
         self.manual_response_timer.timeout.connect(self.flush_manual_response)
         self.manual_response_buffer = []
         self.manual_response_max_lines = 200
+
+        # 配置文件目录（必须在 init_ui 之前定义）
+        self.config_dir = "./config"
+        if not os.path.exists(self.config_dir):
+            os.makedirs(self.config_dir, exist_ok=True)
 
         self.init_ui()
 
@@ -610,6 +625,28 @@ class MotorGUI(QMainWindow):
 
     def init_control_tab(self, parent):
         layout = QVBoxLayout(parent)
+
+        # ========== 配置区域 ==========
+        config_group = QGroupBox("Configuration")
+        config_layout = QHBoxLayout()
+        self.config_combo = QComboBox()
+        self.config_combo.setMinimumWidth(200)
+        self.refresh_config_btn = QPushButton("Refresh List")
+        self.load_config_btn = QPushButton("Load Config")
+        self.save_config_btn = QPushButton("Save Config")
+        config_layout.addWidget(QLabel("Config File:"))
+        config_layout.addWidget(self.config_combo)
+        config_layout.addWidget(self.refresh_config_btn)
+        config_layout.addWidget(self.load_config_btn)
+        config_layout.addWidget(self.save_config_btn)
+        config_layout.addStretch()
+        config_group.setLayout(config_layout)
+        layout.addWidget(config_group)
+
+        self.refresh_config_btn.clicked.connect(self.load_config_list)
+        self.load_config_btn.clicked.connect(self.on_load_config)
+        self.save_config_btn.clicked.connect(self.on_save_config)
+        self.load_config_list()  # 初始扫描
 
         id_group = QGroupBox("Motor Selection")
         id_layout = QHBoxLayout()
@@ -736,6 +773,17 @@ class MotorGUI(QMainWindow):
         self.actual_angle_label = QLabel("Actual Angle: --- °")
         self.actual_angle_label.setFont(QFont("Arial", 12))
         angle_info_layout.addWidget(self.actual_angle_label)
+        # 添加原始角度显示标签
+        self.raw_angle_label = QLabel("Raw Motor Angle: --- °")
+        self.raw_angle_label.setFont(QFont("Arial", 10))
+        angle_info_layout.addWidget(self.raw_angle_label)
+        # 新增：总圈数和模角度标签
+        self.total_rotations_label = QLabel("Total rotations: ---")
+        self.total_rotations_label.setFont(QFont("Arial", 10))
+        angle_info_layout.addWidget(self.total_rotations_label)
+        self.mod_angle_label = QLabel("Mod angle (0-360°): ---")
+        self.mod_angle_label.setFont(QFont("Arial", 10))
+        angle_info_layout.addWidget(self.mod_angle_label)
         angle_info_layout.addStretch()
         dial_layout.addLayout(angle_info_layout, 0)
 
@@ -882,7 +930,7 @@ class MotorGUI(QMainWindow):
         layout.addWidget(info_label)
 
     # ------------------------------------------------------------------
-    # IMU 标签页，新增模型选择功能
+    # IMU 标签页，模型选择功能
     # ------------------------------------------------------------------
     def init_imu_tab(self, parent):
         layout = QVBoxLayout(parent)
@@ -969,6 +1017,136 @@ class MotorGUI(QMainWindow):
         info.setWordWrap(True)
         layout.addWidget(info)
 
+    # ================== 配置文件相关方法 ==================
+    def load_config_list(self):
+        """扫描 config 文件夹下的所有 .json 文件并填充下拉框"""
+        self.config_combo.clear()
+        if not os.path.exists(self.config_dir):
+            os.makedirs(self.config_dir, exist_ok=True)
+        files = [f for f in os.listdir(self.config_dir) if f.endswith('.json')]
+        files.sort()
+        for f in files:
+            self.config_combo.addItem(f)
+        if files:
+            self.config_combo.setCurrentIndex(0)
+
+    def get_current_config(self):
+        """收集当前 GUI 中所有可设置参数，返回字典"""
+        config = {}
+        # 目标值
+        config['targets'] = {
+            'iq': self.target_iq.value(),
+            'id': self.target_id.value(),
+            'speed': self.target_speed.value(),
+            'position': self.target_position.value(),
+            'uq': self.target_uq.value(),
+            'ud': self.target_ud.value()
+        }
+        # PID 参数
+        config['pid'] = {}
+        for name in ['Iq', 'Id', 'Speed', 'Position']:
+            p_spin, i_spin, d_spin, _, _ = self.pid_widgets[name]
+            config['pid'][name] = {
+                'p': p_spin.value(),
+                'i': i_spin.value(),
+                'd': d_spin.value()
+            }
+        # 限幅
+        config['limits'] = {
+            'iq_max': self.limit_iq_max.value(),
+            'iq_min': self.limit_iq_min.value(),
+            'id_max': self.limit_id_max.value(),
+            'id_min': self.limit_id_min.value(),
+            'speed_max': self.limit_speed_max.value(),
+            'speed_min': self.limit_speed_min.value(),
+            'position_max': self.limit_position_max.value(),
+            'position_min': self.limit_position_min.value()
+        }
+        # 齿轮比
+        config['gear_ratio'] = self.gear_ratio_edit.text().strip()
+        return config
+
+    def apply_config(self, config):
+        """根据字典数据设置 GUI 控件"""
+        try:
+            # 目标值
+            targets = config.get('targets', {})
+            self.target_iq.setValue(targets.get('iq', 0))
+            self.target_id.setValue(targets.get('id', 0))
+            self.target_speed.setValue(targets.get('speed', 0))
+            self.target_position.setValue(targets.get('position', 0))
+            self.target_uq.setValue(targets.get('uq', 0))
+            self.target_ud.setValue(targets.get('ud', 0))
+
+            # PID
+            pid_data = config.get('pid', {})
+            for name in ['Iq', 'Id', 'Speed', 'Position']:
+                if name in pid_data:
+                    p_spin, i_spin, d_spin, _, _ = self.pid_widgets[name]
+                    p_spin.setValue(pid_data[name].get('p', 0))
+                    i_spin.setValue(pid_data[name].get('i', 0))
+                    d_spin.setValue(pid_data[name].get('d', 0))
+
+            # 限幅
+            limits = config.get('limits', {})
+            self.limit_iq_max.setValue(limits.get('iq_max', 0))
+            self.limit_iq_min.setValue(limits.get('iq_min', 0))
+            self.limit_id_max.setValue(limits.get('id_max', 0))
+            self.limit_id_min.setValue(limits.get('id_min', 0))
+            self.limit_speed_max.setValue(limits.get('speed_max', 0))
+            self.limit_speed_min.setValue(limits.get('speed_min', 0))
+            self.limit_position_max.setValue(limits.get('position_max', 0))
+            self.limit_position_min.setValue(limits.get('position_min', 0))
+
+            # 齿轮比
+            gear_ratio = config.get('gear_ratio', '1 : 1')
+            self.gear_ratio_edit.setText(gear_ratio)
+
+            QMessageBox.information(self, "Config Loaded", "Configuration applied successfully.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to apply config: {str(e)}")
+
+    def on_load_config(self):
+        """加载选中的配置文件"""
+        file_name = self.config_combo.currentText()
+        if not file_name:
+            QMessageBox.warning(self, "No Config", "No configuration file selected.")
+            return
+        file_path = os.path.join(self.config_dir, file_name)
+        if not os.path.exists(file_path):
+            QMessageBox.critical(self, "Error", f"File not found: {file_path}")
+            self.load_config_list()
+            return
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                config_data = json.load(f)
+            self.apply_config(config_data)
+        except Exception as e:
+            QMessageBox.critical(self, "Load Error", f"Failed to load {file_name}:\n{str(e)}")
+
+    def on_save_config(self):
+        """将当前设置保存为 JSON 配置文件"""
+        file_name, ok = QFileDialog.getSaveFileName(self, "Save Configuration", self.config_dir, "JSON Files (*.json)")
+        if not ok or not file_name:
+            return
+        if not file_name.endswith('.json'):
+            file_name += '.json'
+        config_data = self.get_current_config()
+        try:
+            with open(file_name, 'w', encoding='utf-8') as f:
+                json.dump(config_data, f, indent=4)
+            QMessageBox.information(self, "Saved", f"Configuration saved to:\n{file_name}")
+            self.load_config_list()  # 刷新下拉列表
+            # 尝试选中刚保存的文件
+            idx = self.config_combo.findText(os.path.basename(file_name))
+            if idx >= 0:
+                self.config_combo.setCurrentIndex(idx)
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", f"Failed to save config:\n{str(e)}")
+
+    # ------------------------------------------------------------------
+    # 模型扫描与加载
+    # ------------------------------------------------------------------
     def scan_asset_models(self):
         """扫描 ./asset 文件夹，将支持的模型文件添加到下拉列表"""
         self.model_combo.blockSignals(True)
@@ -1050,7 +1228,7 @@ class MotorGUI(QMainWindow):
                 self.model_combo.setCurrentText("Default Cube")
 
     # ------------------------------------------------------------------
-    # IMU 数据处理与姿态解算 (原有)
+    # IMU 数据处理与姿态解算
     # ------------------------------------------------------------------
     def request_imu_data(self):
         if not self.comm_backend or not self.imu_poll_enabled:
@@ -1207,7 +1385,7 @@ class MotorGUI(QMainWindow):
             self.imu_poll_timer.start(self.imu_poll_interval.value())
 
     # ------------------------------------------------------------------
-    # Communication helpers (原有，未改动)
+    # Communication helpers
     # ------------------------------------------------------------------
     def on_interface_changed(self, text):
         self.update_interface_visibility()
@@ -1641,9 +1819,14 @@ class MotorGUI(QMainWindow):
             actual_angle = motor_position_deg * (self.gear_ratio_num / self.gear_ratio_den)
         else:
             actual_angle = motor_position_deg
+            print("[WARN] Gear ratio denominator is zero, using raw angle")
         self.last_position_deg = motor_position_deg
         self.motor_preview.set_angle(actual_angle)
-        self.actual_angle_label.setText(f"Actual Angle: {actual_angle:.1f}°")
+
+        # 计算负载侧圈数和模角度
+        total_rot = math.floor(actual_angle / 360.0) if actual_angle != 0 else 0
+        mod_ang = actual_angle % 360.0
+        self.actual_angle_label.setText(f"Actual Angle: {actual_angle:.1f}°  (Rot: {total_rot}, Mod: {mod_ang:.1f}°)")
 
     def toggle_polling(self, enabled):
         if enabled:
@@ -1652,7 +1835,7 @@ class MotorGUI(QMainWindow):
                 self.poll_checkbox.setChecked(False)
                 return
             self.poll_enabled = True
-            self.poll_timer.start(50)
+            self.poll_timer.start(20)   # 原为 50，改为 20 ms
         else:
             self.poll_enabled = False
             self.poll_timer.stop()
@@ -1686,16 +1869,13 @@ class MotorGUI(QMainWindow):
         elif self.poll_type == "position":
             self.send_command(0x33,0x00, motor_id=mid)
 
-    # 处理 0x30 响应，更新电流数值显示和绘图
     def handle_iaibic(self, packet):
         ia = packet.data1.as_float()
         ib = packet.data2.as_float()
         ic = packet.data3.as_float()
-        # 更新 Control 标签页中的实时电流显示
         self.label_Ia.setText(f"{ia:.3f} A")
         self.label_Ib.setText(f"{ib:.3f} A")
         self.label_Ic.setText(f"{ic:.3f} A")
-        # 更新数据历史
         self.data_history['time'].append(self.plot_index)
         self.data_history['Ia'].append(ia)
         self.data_history['Ib'].append(ib)
@@ -1720,7 +1900,17 @@ class MotorGUI(QMainWindow):
             self.update_plot()
 
     def handle_position(self, packet):
+        # 不再打印原始字节，减少开销
         pos = packet.data1.as_float()
+
+        # 计算圈数和模360角度
+        total_rotations = math.floor(pos / 360.0) if pos != 0 else 0
+        mod_angle = pos % 360.0
+        self.total_rotations_label.setText(f"Total rotations: {total_rotations}")
+        self.mod_angle_label.setText(f"Mod angle (0-360°): {mod_angle:.2f}°")
+        if hasattr(self, 'raw_angle_label'):
+            self.raw_angle_label.setText(f"Raw Motor Angle: {pos:.1f}°  (Rotations: {total_rotations}, Mod: {mod_angle:.1f}°)")
+
         self.update_preview_angle(pos)
         self.data_history['time'].append(self.plot_index)
         self.data_history['position'].append(pos)

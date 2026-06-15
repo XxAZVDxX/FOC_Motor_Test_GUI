@@ -1,0 +1,43 @@
+{
+    "targets": {
+        "iq": 0.0,
+        "id": 0.0,
+        "speed": 0.0,
+        "position": 0.0,
+        "uq": 0.0,
+        "ud": 0.0
+    },
+    "pid": {
+        "Iq": {
+            "p": 2.5,
+            "i": 0.0045,
+            "d": 0.0
+        },
+        "Id": {
+            "p": 0.0,
+            "i": 0.0,
+            "d": 0.0
+        },
+        "Speed": {
+            "p": 0.0985,
+            "i": 0.00185,
+            "d": 0.0
+        },
+        "Position": {
+            "p": 0.0,
+            "i": 0.0,
+            "d": 0.0
+        }
+    },
+    "limits": {
+        "iq_max": 4.0,
+        "iq_min": -4.0,
+        "id_max": 4.0,
+        "id_min": -4.0,
+        "speed_max": 0.0,
+        "speed_min": 0.0,
+        "position_max": 0.0,
+        "position_min": 0.0
+    },
+    "gear_ratio": "1 : 1"
+}
