@@ -2,6 +2,8 @@
 
 Motor GUI for motor control, monitoring, tuning, and IMU visualization.
 
+<img width="1512" height="1391" alt="Screenshot 2026-06-15 at 11 42 44 PM" src="https://github.com/user-attachments/assets/0f119523-51f3-4d45-bfb0-8cf0e5f72782" />
+
 ## Features
 
 - Serial UART,RS485 and CAN support
