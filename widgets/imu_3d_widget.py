@@ -8,6 +8,8 @@ from pyqtgraph.opengl import GLViewWidget, GLMeshItem, MeshData, GLGridItem
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtGui
 
+from i18n import tr
+
 try:
     import trimesh
     TRIMESH_AVAILABLE = True
@@ -49,7 +51,7 @@ class IMU3DWidget(GLViewWidget):
 
     def load_model_from_file(self, filepath):
         if not TRIMESH_AVAILABLE:
-            QMessageBox.critical(None, "Error", "trimesh library not installed.")
+            QMessageBox.critical(None, tr("Error"), tr("trimesh library not installed."))
             return False
         if not os.path.exists(filepath):
             return False

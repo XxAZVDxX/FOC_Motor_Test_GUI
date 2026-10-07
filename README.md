@@ -29,6 +29,8 @@ Motor GUI for motor control, monitoring, tuning, and IMU visualization.
 - Manual hex command sending
 - IMU 3D visualization
 - Optional custom 3D model loading
+- Light and dark themes
+- UI languages: English, 简体中文, 繁體中文
 
 ## Project Files
 
@@ -36,6 +38,10 @@ Motor GUI for motor control, monitoring, tuning, and IMU visualization.
 - `run.bat` — launcher for Windows
 - `run.sh` — launcher for Linux
 - `run.command` — launcher for macOS (double-click in Finder)
+- `theme.py` — light/dark palettes and the global stylesheet
+- `i18n.py` — translation catalog and the `tr()` lookup helper
+- `settings.py` — loads/saves the selected theme and language
+- `assets/` — icons used by the stylesheet
 
 
 ## Installation
@@ -79,6 +85,42 @@ The application contains these tabs:
 - Communication Log
 - Manual Command
 - IMU 3D Display
+
+## Appearance and Language
+
+Both settings live in the **View** menu and apply immediately — no restart needed.
+
+### Theme
+
+**View → Theme → Light / Dark**
+
+The theme restyles the whole window: widget palette, tab bar, status bar,
+buttons, the phase-current labels, the 2D motor preview and the IMU 3D
+background.
+
+### Language
+
+**View → Language → English / 简体中文 / 繁體中文**
+
+Switching a language retranslates every label, button, tab title, group box and
+status message in place. Values already shown on screen (angles, current
+readings, plot labels) are not re-rendered until the next update.
+
+### Persistence
+
+The chosen theme and language are written to `config/settings.json` and restored
+on the next launch:
+
+```json
+{
+  "theme": "light",
+  "language": "en"
+}
+```
+
+`config/settings.json` is a settings file, not a motor profile, so it is hidden
+from the configuration dropdown in the Motor Control tab. Delete it to fall back
+to the defaults (`light` + `en`).
 
 ## Usage
 
@@ -164,3 +206,15 @@ Use the manual command tab to send raw hexadecimal commands and inspect received
 - Confirm all required packages are installed
 - Re-run the .bat or .sh
 - Activate the virtual environment before running
+
+### Window is taller than the screen
+
+The Motor Control and PID Tuning tabs are dense. When a tab does not fit
+vertically it is placed inside a scroll area, and the window is clamped to the
+available screen area on startup. Maximise the window, or scroll the affected
+tab.
+
+### Wrong theme or language after launch
+
+The last selection is remembered in `config/settings.json`. Delete that file to
+reset both back to the defaults (light theme, English).

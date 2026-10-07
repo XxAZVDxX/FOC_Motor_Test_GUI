@@ -12,9 +12,15 @@ from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTabWidget,
                              QMessageBox, QFileDialog, QLabel, QApplication,
                              QFormLayout, QComboBox, QHBoxLayout, QLineEdit,
                              QPushButton, QDoubleSpinBox, QCheckBox, QSpinBox,
-                             QGroupBox, QPlainTextEdit)
+                             QGroupBox, QPlainTextEdit, QAction, QActionGroup,
+                             QScrollArea, QFrame)
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QFont
+
+import i18n
+import settings
+import theme
+from i18n import tr
 
 from protocol import CommandPacket
 from comm_backend import SerialBackend, CANBackend, CAN_AVAILABLE
@@ -22,6 +28,27 @@ from widgets.motor_preview import MotorPreviewWidget
 from widgets.imu_3d_widget import IMU3DWidget
 from utils import compute_rotations_and_mod
 from config_manager import ConfigManager
+
+# 界面语言/主题切换时，这些字符串通过 tr() 取译文，键为英文原文
+MODE_ITEMS = [
+    (0, "Stop"),
+    (1, "Self-test"),
+    (2, "Calibration"),
+    (3, "Open-loop"),
+    (4, "Current loop"),
+    (5, "Speed loop"),
+    (6, "Position loop"),
+]
+
+INTERFACE_ITEMS = [
+    ("serial", "Serial (UART/RS485)"),
+    ("can", "CAN"),
+]
+
+DEFAULT_CUBE = "Default Cube"
+
+TAB_KEYS = ["Connection", "Motor Control", "PID Tuning", "Real-time Data",
+            "Limits", "Manual", "IMU 3D"]
 
 # ==================== 互补滤波器（带限幅和衰减） ====================
 class ComplementaryFilter:
@@ -73,10 +100,20 @@ except ImportError:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, initial_settings=None):
         super().__init__()
-        self.setWindowTitle("Motor Control GUI")
+        if initial_settings is None:
+            initial_settings = settings.load()
+        self.current_theme = initial_settings["theme"]
+        tr.set_language(initial_settings["language"])
+
+        self.setWindowTitle(tr("Motor Control GUI"))
         self.setGeometry(100, 100, 1400, 900)
+        self._clamp_to_screen()
+
+        # 语言/主题切换时需要重新赋值的文本，集中保存便于 retranslate_ui()
+        self._text_bindings = []
+        self._combo_specs = {}
 
         self.comm_backend = None
         self.motor_id = None
@@ -123,6 +160,9 @@ class MainWindow(QMainWindow):
         self.filter = None
         self.calibrating_gyro = False
         self.gyro_bias = [0.0, 0.0, 0.0]
+        self.last_roll_deg = 0.0
+        self.last_pitch_deg = 0.0
+        self.last_yaw_deg = 0.0
         self.calib_samples = 0
         self.calib_max_samples = 300          # 采集300个样本，约6-10秒
         self.calib_buffer = []
@@ -139,65 +179,232 @@ class MainWindow(QMainWindow):
         self.init_ui()
 
     def init_ui(self):
+        self.create_menu_bar()
+
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
-        tabs = QTabWidget()
-        main_layout.addWidget(tabs)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(6)
+        self.tabs = QTabWidget()
+        main_layout.addWidget(self.tabs)
 
-        conn_tab = self.create_connection_tab()
-        ctrl_tab = self.create_control_tab()
-        pid_tab = self.create_pid_tab()
-        data_tab = self.create_data_tab()
-        limits_tab = self.create_limits_tab()
-        manual_tab = self.create_manual_tab()
-        imu_tab = self.create_imu_tab()
+        # 内容过高的标签页放入滚动区域，避免小屏幕上控件不可达
+        tab_factories = [
+            (self.create_connection_tab, False),
+            (self.create_control_tab, True),
+            (self.create_pid_tab, True),
+            (self.create_data_tab, False),
+            (self.create_limits_tab, False),
+            (self.create_manual_tab, False),
+            (self.create_imu_tab, False),
+        ]
+        for i, (factory, force_scroll) in enumerate(tab_factories):
+            self.tabs.addTab(self._wrap_scrollable(factory(), force_scroll), tr(TAB_KEYS[i]))
 
-        tabs.addTab(conn_tab, "Connection")
-        tabs.addTab(ctrl_tab, "Motor Control")
-        tabs.addTab(pid_tab, "PID Tuning")
-        tabs.addTab(data_tab, "Real-time Data")
-        tabs.addTab(limits_tab, "Limits")
-        tabs.addTab(manual_tab, "Manual")
-        tabs.addTab(imu_tab, "IMU 3D")
-
-        self.status_label = QLabel("Not connected")
+        self.status_label = QLabel(tr("Not connected"))
         self.statusBar().addWidget(self.status_label)
+
+        self.apply_theme(self.current_theme)
+
+    # ---------- 菜单栏 ----------
+    def _wrap_scrollable(self, widget, force=False):
+        """把过高的标签页放进滚动区域，保证小屏幕下也能访问全部控件。
+
+        force=True 用于已知必然超高的标签页（其高度依赖运行时字体度量，
+        不适合在布局前判断）。
+        """
+        if not force and widget.minimumSizeHint().height() <= 700:
+            return widget
+        scroll = QScrollArea()
+        scroll.setWidget(widget)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.viewport().setAutoFillBackground(False)
+        return scroll
+
+    def _clamp_to_screen(self):
+        """窗口按内容最小尺寸展开，屏幕装不下时自动收缩，避免标题栏跑出屏幕。"""
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        avail = screen.availableGeometry()
+        width = min(self.width(), avail.width())
+        height = min(self.height(), avail.height())
+        if width != self.width() or height != self.height():
+            self.resize(width, height)
+        self.move(max(avail.left(), min(self.x(), avail.right() - width)),
+                  max(avail.top(), min(self.y(), avail.bottom() - height)))
+
+    def create_menu_bar(self):
+        view_menu = self.menuBar().addMenu(tr("&View"))
+        self._view_menu = view_menu
+
+        theme_menu = view_menu.addMenu(tr("&Theme"))
+        self.theme_group = QActionGroup(self)
+        self.theme_group.setExclusive(True)
+        for code, name in theme.theme_names():
+            action = QAction(tr(name), self, checkable=True)
+            action.setData(code)
+            action.setChecked(code == self.current_theme)
+            action.triggered.connect(lambda _checked, c=code: self.set_theme(c))
+            self.theme_group.addAction(action)
+            theme_menu.addAction(action)
+            self._text_bindings.append((action, name, "setText"))
+
+        view_menu.addSeparator()
+
+        lang_menu = view_menu.addMenu(tr("&Language"))
+        self.lang_group = QActionGroup(self)
+        self.lang_group.setExclusive(True)
+        for code, name in i18n.LANGUAGES:
+            action = QAction(name, self, checkable=True)
+            action.setData(code)
+            action.setChecked(code == tr.language)
+            action.triggered.connect(lambda _checked, c=code: self.set_language(c))
+            self.lang_group.addAction(action)
+            lang_menu.addAction(action)
+
+        help_menu = self.menuBar().addMenu(tr("&Help"))
+        about_action = QAction(tr("About"), self)
+        about_action.triggered.connect(self.show_about)
+        help_menu.addAction(about_action)
+
+        # 语言切换后需要重建菜单文本
+        self._text_bindings.append((self.menuBar().actions()[0], "&View", "setText"))
+        self._text_bindings.append((self.menuBar().actions()[1], "&Help", "setText"))
+        self._theme_menu = theme_menu
+        self._lang_menu = lang_menu
+        self._about_action = about_action
+
+    def show_about(self):
+        QMessageBox.about(self, tr("About"), tr("About Text"))
+
+    # ---------- 文本绑定 ----------
+    def _label(self, key):
+        """创建随语言切换自动更新的 QLabel。"""
+        label = QLabel(tr(key))
+        self._text_bindings.append((label, key, "setText"))
+        return label
+
+    def _bind_text(self, widget, key, setter="setText"):
+        """注册一个在语言切换时需要重新设置文本的控件。"""
+        getattr(widget, setter)(tr(key))
+        self._text_bindings.append((widget, key, setter))
+        return widget
+
+    def _fill_combo(self, combo, entries, keep=True):
+        """用 itemData 填充下拉框，逻辑判断只依赖 itemData 而非显示文本。"""
+        current = combo.currentData() if keep else None
+        combo.blockSignals(True)
+        combo.clear()
+        for data, key in entries:
+            combo.addItem(tr(key), data)
+        idx = combo.findData(current)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+        combo.setProperty("_i18n_entries", entries)
+
+    # ---------- 主题 / 语言切换 ----------
+    def apply_theme(self, theme_name):
+        app = QApplication.instance()
+        self.colors = theme.apply_theme(app, theme_name)
+        theme.apply_plot_theme(self.plot_widget, theme_name)
+        self.motor_preview.set_colors(self.colors)
+        self.imu_3d_view.setBackgroundColor(self.colors["gl_bg"])
+        self.imu_3d_view.update()
+        self.label_Ia.setStyleSheet("color: %s;" % self.colors["phase_a"])
+        self.label_Ib.setStyleSheet("color: %s;" % self.colors["phase_b"])
+        self.label_Ic.setStyleSheet("color: %s;" % self.colors["phase_c"])
+        self._refresh_status_color()
+        if self.config_manager.current_path:
+            self._update_config_status(True)
+        else:
+            self.config_status_label.setText(tr("No config loaded"))
+            self.config_status_label.setStyleSheet(
+                "color: %s; font-style: italic;" % self.colors["status_muted"])
+
+    def _refresh_status_color(self):
+        self.status_label.setStyleSheet(
+            "color: %s; padding: 1px 4px;" % self.colors["status_muted"])
+
+    def set_theme(self, theme_name):
+        self.current_theme = theme_name
+        self.apply_theme(theme_name)
+        self._persist_settings()
+
+    def set_language(self, language_code):
+        if not tr.set_language(language_code):
+            return
+        self.retranslate_ui()
+        self._persist_settings()
+
+    def _persist_settings(self):
+        settings.save({"theme": self.current_theme, "language": tr.language})
+
+    def retranslate_ui(self):
+        """语言切换后重新设置所有界面文本（不重建控件）。"""
+        self.setWindowTitle(tr("Motor Control GUI"))
+        self._theme_menu.setTitle(tr("&Theme"))
+        self._lang_menu.setTitle(tr("&Language"))
+        self._about_action.setText(tr("About"))
+        for widget, key, setter in self._text_bindings:
+            getattr(widget, setter)(tr(key))
+        for i, key in enumerate(TAB_KEYS):
+            self.tabs.setTabText(i, tr(key))
+        for combo in self.findChildren(QComboBox):
+            entries = combo.property("_i18n_entries")
+            if entries:
+                self._fill_combo(combo, entries)
+                if combo is self.mode_combo:
+                    self.handle_mode_response(combo.currentData())
+        self.plot_widget.setLabel('left', tr("Value"))
+        self.plot_widget.setLabel('bottom', tr("Time (samples)"))
+        self.refresh_interval_spin.setSuffix(tr(" ms"))
+        # 带 itemData 的下拉框：显示文本需要单独刷新
+        if self.motor_id_combo.count():
+            self.motor_id_combo.setItemText(0, tr("None"))
+        cube_idx = self.model_combo.findData(DEFAULT_CUBE)
+        if cube_idx >= 0:
+            self.model_combo.setItemText(cube_idx, tr(DEFAULT_CUBE))
 
     # ---------- 创建标签页的函数 ----------
     def create_connection_tab(self):
         widget = QWidget()
         layout = QFormLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
         self.interface_combo = QComboBox()
-        self.interface_combo.addItems(["Serial (UART/RS485)", "CAN"])
+        self._fill_combo(self.interface_combo, INTERFACE_ITEMS, keep=False)
         self.serial_port_combo = QComboBox()
-        self.refresh_ports_btn = QPushButton("Refresh")
+        self.refresh_ports_btn = self._bind_text(QPushButton(), "Refresh")
         self.baudrate_combo = QComboBox()
         self.baudrate_combo.addItems(["9600","19200","38400","57600","115200","2000000"])
         self.can_channel_edit = QLineEdit("PCAN_USBBUS1")
         self.can_bustype_combo = QComboBox()
         self.can_bustype_combo.addItems(["pcan","socketcan","kvaser","ixxat","vector"])
         self.can_bitrate_edit = QLineEdit("500000")
-        self.connect_btn = QPushButton("Connect")
-        self.detect_btn = QPushButton("Detect Motor ID")
+        self.connect_btn = self._bind_text(QPushButton(), "Connect")
+        self.detect_btn = self._bind_text(QPushButton(), "Detect Motor ID")
         self.detect_btn.setEnabled(False)
-        self.motor_id_label = QLabel("None")
+        self.motor_id_label = self._label("None")
 
-        layout.addRow("Interface:", self.interface_combo)
+        layout.addRow(self._label("Interface:"), self.interface_combo)
         port_layout = QHBoxLayout()
         port_layout.addWidget(self.serial_port_combo)
         port_layout.addWidget(self.refresh_ports_btn)
-        layout.addRow("Serial Port:", port_layout)
-        layout.addRow("Baudrate:", self.baudrate_combo)
-        layout.addRow("CAN Channel:", self.can_channel_edit)
-        layout.addRow("CAN Bustype:", self.can_bustype_combo)
-        layout.addRow("CAN Bitrate:", self.can_bitrate_edit)
+        layout.addRow(self._label("Serial Port:"), port_layout)
+        layout.addRow(self._label("Baudrate:"), self.baudrate_combo)
+        layout.addRow(self._label("CAN Channel:"), self.can_channel_edit)
+        layout.addRow(self._label("CAN Bustype:"), self.can_bustype_combo)
+        layout.addRow(self._label("CAN Bitrate:"), self.can_bitrate_edit)
         layout.addRow(self.connect_btn)
         layout.addRow(self.detect_btn)
-        layout.addRow("Detected Motor ID:", self.motor_id_label)
+        layout.addRow(self._label("Detected Motor ID:"), self.motor_id_label)
 
-        self.interface_combo.currentTextChanged.connect(self.update_interface_visibility)
+        self.interface_combo.currentIndexChanged.connect(self.update_interface_visibility)
         self.refresh_ports_btn.clicked.connect(self.refresh_serial_ports)
         self.connect_btn.clicked.connect(self.toggle_connection)
         self.detect_btn.clicked.connect(self.detect_motor_id)
@@ -207,18 +414,23 @@ class MainWindow(QMainWindow):
     def create_control_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
-        config_group = QGroupBox("Configuration")
+        config_group = QGroupBox(tr("Configuration"))
+        self._text_bindings.append((config_group, "Configuration", "setTitle"))
         cfg_vlayout = QVBoxLayout()
+        cfg_vlayout.setSpacing(6)
 
         # row 1: dropdown + buttons
         cfg_row1 = QHBoxLayout()
+        cfg_row1.setSpacing(6)
         self.config_combo = QComboBox()
-        self.refresh_config_btn = QPushButton("Refresh")
-        self.load_config_btn = QPushButton("Load")
-        self.import_config_btn = QPushButton("Import…")
-        self.save_as_btn = QPushButton("Save As…")
-        cfg_row1.addWidget(QLabel("Config:"))
+        self.refresh_config_btn = self._bind_text(QPushButton(), "Refresh")
+        self.load_config_btn = self._bind_text(QPushButton(), "Load")
+        self.import_config_btn = self._bind_text(QPushButton(), "Import…")
+        self.save_as_btn = self._bind_text(QPushButton(), "Save As…")
+        cfg_row1.addWidget(self._label("Config:"))
         cfg_row1.addWidget(self.config_combo, 1)
         cfg_row1.addWidget(self.refresh_config_btn)
         cfg_row1.addWidget(self.load_config_btn)
@@ -228,8 +440,7 @@ class MainWindow(QMainWindow):
 
         # row 2: status label
         cfg_row2 = QHBoxLayout()
-        self.config_status_label = QLabel("No config loaded")
-        self.config_status_label.setStyleSheet("color: gray; font-style: italic;")
+        self.config_status_label = QLabel(tr("No config loaded"))
         cfg_row2.addWidget(self.config_status_label)
         cfg_row2.addStretch()
         cfg_vlayout.addLayout(cfg_row2)
@@ -243,63 +454,72 @@ class MainWindow(QMainWindow):
         self.import_config_btn.clicked.connect(self.on_import_config)
         self.save_as_btn.clicked.connect(self.on_save_config)
 
-        id_group = QGroupBox("Motor Selection")
+        id_group = QGroupBox(tr("Motor Selection"))
+        self._text_bindings.append((id_group, "Motor Selection", "setTitle"))
         id_layout = QHBoxLayout()
+        id_layout.setSpacing(6)
         self.motor_id_combo = QComboBox()
-        self.motor_id_combo.addItem("None")
-        id_layout.addWidget(QLabel("Motor ID:"))
+        self.motor_id_combo.addItem(tr("None"), None)
+        id_layout.addWidget(self._label("Motor ID:"))
         id_layout.addWidget(self.motor_id_combo)
         id_group.setLayout(id_layout)
         layout.addWidget(id_group)
-        self.motor_id_combo.currentTextChanged.connect(self.on_motor_id_changed)
+        self.motor_id_combo.currentIndexChanged.connect(self.on_motor_id_changed)
 
-        mode_group = QGroupBox("Operating Mode")
+        mode_group = QGroupBox(tr("Operating Mode"))
+        self._text_bindings.append((mode_group, "Operating Mode", "setTitle"))
         mode_layout = QFormLayout()
+        mode_layout.setSpacing(6)
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["Stop","Self-test","Calibration","Open-loop",
-                                  "Current loop","Speed loop","Position loop"])
-        self.set_mode_btn = QPushButton("Set")
-        self.get_mode_btn = QPushButton("Get")
-        mode_layout.addRow("Mode:", self.mode_combo)
+        self._fill_combo(self.mode_combo, MODE_ITEMS, keep=False)
+        self.set_mode_btn = self._bind_text(QPushButton(), "Set")
+        self.get_mode_btn = self._bind_text(QPushButton(), "Get")
+        mode_layout.addRow(self._label("Mode:"), self.mode_combo)
         btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(6)
         btn_layout.addWidget(self.set_mode_btn)
         btn_layout.addWidget(self.get_mode_btn)
         mode_layout.addRow(btn_layout)
         mode_group.setLayout(mode_layout)
         layout.addWidget(mode_group)
 
-        param_group = QGroupBox("Motor Parameters")
+        param_group = QGroupBox(tr("Motor Parameters"))
+        self._text_bindings.append((param_group, "Motor Parameters", "setTitle"))
         param_layout = QFormLayout()
+        param_layout.setSpacing(6)
         self.pole_pair_label = QLabel("---")
         self.offset_label = QLabel("---")
         self.encoder_dir_label = QLabel("---")
-        get_params_btn = QPushButton("Get Parameters")
-        param_layout.addRow("Pole Pairs:", self.pole_pair_label)
-        param_layout.addRow("Zero Offset (°):", self.offset_label)
-        param_layout.addRow("Encoder Direction:", self.encoder_dir_label)
+        get_params_btn = self._bind_text(QPushButton(), "Get Parameters")
+        param_layout.addRow(self._label("Pole Pairs:"), self.pole_pair_label)
+        param_layout.addRow(self._label("Zero Offset (°):"), self.offset_label)
+        param_layout.addRow(self._label("Encoder Direction:"), self.encoder_dir_label)
         param_layout.addRow(get_params_btn)
         param_group.setLayout(param_layout)
         layout.addWidget(param_group)
         get_params_btn.clicked.connect(self.get_motor_parameters)
 
-        target_group = QGroupBox("Target Values")
+        target_group = QGroupBox(tr("Target Values"))
+        self._text_bindings.append((target_group, "Target Values", "setTitle"))
         target_layout = QFormLayout()
+        target_layout.setSpacing(6)
         self.target_iq = QDoubleSpinBox(); self.target_iq.setRange(-10,10); self.target_iq.setDecimals(3)
         self.target_id = QDoubleSpinBox(); self.target_id.setRange(-10,10); self.target_id.setDecimals(3)
         self.target_speed = QDoubleSpinBox(); self.target_speed.setRange(-5000,5000)
         self.target_position = QDoubleSpinBox(); self.target_position.setRange(-5000,5000)
         self.target_uq = QDoubleSpinBox(); self.target_uq.setRange(-6,6)
         self.target_ud = QDoubleSpinBox(); self.target_ud.setRange(-6,6)
-        set_target_btn = QPushButton("Set All")
-        get_target_btn = QPushButton("Get All")
-        self.get_speed_btn = QPushButton("Get Speed")
-        target_layout.addRow("Iq:", self.target_iq)
-        target_layout.addRow("Id:", self.target_id)
-        target_layout.addRow("Speed (rpm):", self.target_speed)
-        target_layout.addRow("Position (deg):", self.target_position)
-        target_layout.addRow("Uq:", self.target_uq)
-        target_layout.addRow("Ud:", self.target_ud)
+        set_target_btn = self._bind_text(QPushButton(), "Set All")
+        get_target_btn = self._bind_text(QPushButton(), "Get All")
+        self.get_speed_btn = self._bind_text(QPushButton(), "Get Speed")
+        target_layout.addRow(self._label("Iq:"), self.target_iq)
+        target_layout.addRow(self._label("Id:"), self.target_id)
+        target_layout.addRow(self._label("Speed (rpm):"), self.target_speed)
+        target_layout.addRow(self._label("Position (deg):"), self.target_position)
+        target_layout.addRow(self._label("Uq:"), self.target_uq)
+        target_layout.addRow(self._label("Ud:"), self.target_ud)
         btn_hlay = QHBoxLayout()
+        btn_hlay.setSpacing(6)
         btn_hlay.addWidget(set_target_btn)
         btn_hlay.addWidget(get_target_btn)
         btn_hlay.addWidget(self.get_speed_btn)
@@ -310,54 +530,65 @@ class MainWindow(QMainWindow):
         get_target_btn.clicked.connect(self.get_targets)
         self.get_speed_btn.clicked.connect(self.get_motor_speed)
 
-        current_group = QGroupBox("Phase Currents")
+        current_group = QGroupBox(tr("Phase Currents"))
+        self._text_bindings.append((current_group, "Phase Currents", "setTitle"))
         curr_layout = QFormLayout()
-        self.label_Ia = QLabel("0.000 A"); self.label_Ia.setStyleSheet("color:#FF0000")
-        self.label_Ib = QLabel("0.000 A"); self.label_Ib.setStyleSheet("color:#00AA00")
-        self.label_Ic = QLabel("0.000 A"); self.label_Ic.setStyleSheet("color:#0000FF")
-        curr_layout.addRow("Ia:", self.label_Ia)
-        curr_layout.addRow("Ib:", self.label_Ib)
-        curr_layout.addRow("Ic:", self.label_Ic)
+        curr_layout.setSpacing(6)
+        self.label_Ia = QLabel("0.000 A")
+        self.label_Ib = QLabel("0.000 A")
+        self.label_Ic = QLabel("0.000 A")
+        curr_layout.addRow(self._label("Ia:"), self.label_Ia)
+        curr_layout.addRow(self._label("Ib:"), self.label_Ib)
+        curr_layout.addRow(self._label("Ic:"), self.label_Ic)
         current_group.setLayout(curr_layout)
         layout.addWidget(current_group)
 
-        auto_group = QGroupBox("Auto Refresh")
+        auto_group = QGroupBox(tr("Auto Refresh"))
+        self._text_bindings.append((auto_group, "Auto Refresh", "setTitle"))
         auto_layout = QHBoxLayout()
-        self.auto_refresh_cb = QCheckBox("Enable")
+        auto_layout.setSpacing(6)
+        self.auto_refresh_cb = QCheckBox(tr("Enable"))
+        self._text_bindings.append((self.auto_refresh_cb, "Enable", "setText"))
         self.auto_refresh_cb.setChecked(True)
         self.auto_refresh_cb.toggled.connect(self.toggle_auto_refresh)
         self.refresh_interval_spin = QSpinBox()
         self.refresh_interval_spin.setRange(100,5000)
         self.refresh_interval_spin.setValue(1000)
-        self.refresh_interval_spin.setSuffix(" ms")
+        self.refresh_interval_spin.setSuffix(tr(" ms"))
         auto_layout.addWidget(self.auto_refresh_cb)
-        auto_layout.addWidget(QLabel("Interval:"))
+        auto_layout.addWidget(self._label("Interval:"))
         auto_layout.addWidget(self.refresh_interval_spin)
-        self.preview_auto_cb = QCheckBox("Auto Refresh Preview")
+        self.preview_auto_cb = QCheckBox(tr("Auto Refresh Preview"))
+        self._text_bindings.append((self.preview_auto_cb, "Auto Refresh Preview", "setText"))
         self.preview_auto_cb.setChecked(True)
         self.preview_auto_cb.toggled.connect(self.toggle_preview_auto_refresh)
         auto_layout.addWidget(self.preview_auto_cb)
         auto_group.setLayout(auto_layout)
         layout.addWidget(auto_group)
 
-        preview_group = QGroupBox("Motor Preview")
+        preview_group = QGroupBox(tr("Motor Preview"))
+        self._text_bindings.append((preview_group, "Motor Preview", "setTitle"))
         preview_layout = QVBoxLayout()
+        preview_layout.setSpacing(6)
         gear_layout = QHBoxLayout()
-        gear_layout.addWidget(QLabel("Gear Ratio:"))
+        gear_layout.setSpacing(6)
+        gear_layout.addWidget(self._label("Gear Ratio:"))
         self.gear_ratio_edit = QLineEdit("1 : 1")
         self.gear_ratio_edit.textChanged.connect(self.update_gear_ratio)
         gear_layout.addWidget(self.gear_ratio_edit)
         preview_layout.addLayout(gear_layout)
 
         dial_layout = QHBoxLayout()
+        dial_layout.setSpacing(6)
         self.motor_preview = MotorPreviewWidget()
         dial_layout.addWidget(self.motor_preview, 1)
         info_layout = QVBoxLayout()
-        self.actual_angle_label = QLabel("Actual Angle: --- °")
-        self.raw_angle_label = QLabel("Raw Motor Angle: --- °")
-        self.total_rotations_label = QLabel("Total rotations: ---")
-        self.mod_angle_label = QLabel("Mod angle (0-360°): ---")
-        self.speed_label = QLabel("Motor Speed: --- rpm")
+        info_layout.setSpacing(4)
+        self.actual_angle_label = self._label("Actual Angle: --- °")
+        self.raw_angle_label = self._label("Raw Motor Angle: --- °")
+        self.total_rotations_label = self._label("Total rotations: ---")
+        self.mod_angle_label = self._label("Mod angle (0-360°): ---")
+        self.speed_label = self._label("Motor Speed: --- rpm")
         self.speed_label.setFont(QFont("Arial", 10))
 
         info_layout.addWidget(self.actual_angle_label)
@@ -379,21 +610,25 @@ class MainWindow(QMainWindow):
     def create_pid_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
         self.pid_widgets = {}
         for name in ['Iq','Id','Speed','Position']:
-            group = QGroupBox(f"{name} PID")
+            group = QGroupBox(tr("{} PID").format(name))
             form = QFormLayout()
+            form.setSpacing(6)
             p = QDoubleSpinBox(); p.setRange(-1000,1000); p.setDecimals(6)
             i = QDoubleSpinBox(); i.setRange(-1000,1000); i.setDecimals(6)
             d = QDoubleSpinBox(); d.setRange(-1000,1000); d.setDecimals(6)
-            set_btn = QPushButton("Set")
-            get_btn = QPushButton("Get")
+            set_btn = self._bind_text(QPushButton(), "Set")
+            get_btn = self._bind_text(QPushButton(), "Get")
             btn_layout = QHBoxLayout()
+            btn_layout.setSpacing(6)
             btn_layout.addWidget(set_btn)
             btn_layout.addWidget(get_btn)
-            form.addRow("P:", p)
-            form.addRow("I:", i)
-            form.addRow("D:", d)
+            form.addRow(self._label("P:"), p)
+            form.addRow(self._label("I:"), i)
+            form.addRow(self._label("D:"), d)
             form.addRow(btn_layout)
             group.setLayout(form)
             layout.addWidget(group)
@@ -405,23 +640,27 @@ class MainWindow(QMainWindow):
     def create_data_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
         top_layout = QHBoxLayout()
+        top_layout.setSpacing(6)
         self.plot_combo = QComboBox()
         self.plot_combo.addItems(["IaIbIc","IqId","Speed","Position"])
-        self.poll_checkbox = QCheckBox("Enable Polling")
-        top_layout.addWidget(QLabel("Plot:"))
+        self.poll_checkbox = QCheckBox(tr("Enable Polling"))
+        self._text_bindings.append((self.poll_checkbox, "Enable Polling", "setText"))
+        top_layout.addWidget(self._label("Plot:"))
         top_layout.addWidget(self.plot_combo)
         top_layout.addWidget(self.poll_checkbox)
         layout.addLayout(top_layout)
 
         self.plot_widget = pg.PlotWidget()
-        self.plot_widget.setLabel('left', 'Value')
-        self.plot_widget.setLabel('bottom', 'Time (samples)')
+        self.plot_widget.setLabel('left', tr("Value"))
+        self.plot_widget.setLabel('bottom', tr("Time (samples)"))
         self.plot_widget.addLegend()
         self.plot_curves = {}
         layout.addWidget(self.plot_widget)
 
-        save_btn = QPushButton("Save Data to CSV")
+        save_btn = self._bind_text(QPushButton(), "Save Data to CSV")
         save_btn.clicked.connect(self.save_data)
         layout.addWidget(save_btn)
 
@@ -432,6 +671,8 @@ class MainWindow(QMainWindow):
     def create_limits_tab(self):
         widget = QWidget()
         layout = QFormLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
         self.limit_iq_max = QDoubleSpinBox(); self.limit_iq_max.setRange(-100,100)
         self.limit_iq_min = QDoubleSpinBox(); self.limit_iq_min.setRange(-100,100)
         self.limit_id_max = QDoubleSpinBox(); self.limit_id_max.setRange(-100,100)
@@ -440,16 +681,16 @@ class MainWindow(QMainWindow):
         self.limit_speed_min = QDoubleSpinBox(); self.limit_speed_min.setRange(-10000,10000)
         self.limit_position_max = QDoubleSpinBox(); self.limit_position_max.setRange(-10000,10000)
         self.limit_position_min = QDoubleSpinBox(); self.limit_position_min.setRange(-10000,10000)
-        layout.addRow("Iq max:", self.limit_iq_max)
-        layout.addRow("Iq min:", self.limit_iq_min)
-        layout.addRow("Id max:", self.limit_id_max)
-        layout.addRow("Id min:", self.limit_id_min)
-        layout.addRow("Speed max:", self.limit_speed_max)
-        layout.addRow("Speed min:", self.limit_speed_min)
-        layout.addRow("Position max:", self.limit_position_max)
-        layout.addRow("Position min:", self.limit_position_min)
-        set_btn = QPushButton("Set Limits")
-        get_btn = QPushButton("Get Limits")
+        layout.addRow(self._label("Iq max:"), self.limit_iq_max)
+        layout.addRow(self._label("Iq min:"), self.limit_iq_min)
+        layout.addRow(self._label("Id max:"), self.limit_id_max)
+        layout.addRow(self._label("Id min:"), self.limit_id_min)
+        layout.addRow(self._label("Speed max:"), self.limit_speed_max)
+        layout.addRow(self._label("Speed min:"), self.limit_speed_min)
+        layout.addRow(self._label("Position max:"), self.limit_position_max)
+        layout.addRow(self._label("Position min:"), self.limit_position_min)
+        set_btn = self._bind_text(QPushButton(), "Set Limits")
+        get_btn = self._bind_text(QPushButton(), "Get Limits")
         layout.addRow(set_btn, get_btn)
         set_btn.clicked.connect(self.set_limits)
         get_btn.clicked.connect(self.get_limits)
@@ -458,21 +699,27 @@ class MainWindow(QMainWindow):
     def create_manual_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        cmd_group = QGroupBox("Send Command (Hex)")
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        cmd_group = QGroupBox(tr("Send Command (Hex)"))
+        self._text_bindings.append((cmd_group, "Send Command (Hex)", "setTitle"))
         cmd_layout = QVBoxLayout()
+        cmd_layout.setSpacing(6)
         self.manual_cmd_edit = QPlainTextEdit()
         self.manual_cmd_edit.setMaximumHeight(100)
-        send_btn = QPushButton("Send")
+        send_btn = self._bind_text(QPushButton(), "Send")
         cmd_layout.addWidget(self.manual_cmd_edit)
         cmd_layout.addWidget(send_btn)
         cmd_group.setLayout(cmd_layout)
         layout.addWidget(cmd_group)
 
-        resp_group = QGroupBox("Response (Raw Hex)")
+        resp_group = QGroupBox(tr("Response (Raw Hex)"))
+        self._text_bindings.append((resp_group, "Response (Raw Hex)", "setTitle"))
         resp_layout = QVBoxLayout()
+        resp_layout.setSpacing(6)
         self.manual_response_text = QPlainTextEdit()
         self.manual_response_text.setReadOnly(True)
-        clear_btn = QPushButton("Clear")
+        clear_btn = self._bind_text(QPushButton(), "Clear")
         resp_layout.addWidget(self.manual_response_text)
         resp_layout.addWidget(clear_btn)
         resp_group.setLayout(resp_layout)
@@ -485,14 +732,18 @@ class MainWindow(QMainWindow):
     def create_imu_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
         ctrl_layout = QHBoxLayout()
-        self.imu_poll_cb = QCheckBox("Enable IMU Polling")
+        ctrl_layout.setSpacing(6)
+        self.imu_poll_cb = QCheckBox(tr("Enable IMU Polling"))
+        self._text_bindings.append((self.imu_poll_cb, "Enable IMU Polling", "setText"))
         self.imu_poll_interval = QSpinBox()
         self.imu_poll_interval.setRange(10,500)
         self.imu_poll_interval.setValue(50)
         ctrl_layout.addWidget(self.imu_poll_cb)
-        ctrl_layout.addWidget(QLabel("Interval (ms):"))
+        ctrl_layout.addWidget(self._label("Interval (ms):"))
         ctrl_layout.addWidget(self.imu_poll_interval)
         layout.addLayout(ctrl_layout)
 
@@ -500,45 +751,55 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.imu_3d_view, stretch=2)
 
         model_layout = QHBoxLayout()
+        model_layout.setSpacing(6)
         self.model_combo = QComboBox()
-        self.model_combo.addItem("Default Cube")
-        refresh_model_btn = QPushButton("Refresh")
-        browse_btn = QPushButton("Browse")
-        reset_btn = QPushButton("Reset")
-        model_layout.addWidget(QLabel("3D Model:"))
+        self.model_combo.addItem(tr(DEFAULT_CUBE), DEFAULT_CUBE)
+        refresh_model_btn = self._bind_text(QPushButton(), "Refresh")
+        browse_btn = self._bind_text(QPushButton(), "Browse")
+        reset_btn = self._bind_text(QPushButton(), "Reset")
+        model_layout.addWidget(self._label("3D Model:"))
         model_layout.addWidget(self.model_combo)
         model_layout.addWidget(refresh_model_btn)
         model_layout.addWidget(browse_btn)
         model_layout.addWidget(reset_btn)
         layout.addLayout(model_layout)
 
-        data_group = QGroupBox("IMU Data")
+        data_group = QGroupBox(tr("IMU Data"))
+        self._text_bindings.append((data_group, "IMU Data", "setTitle"))
         data_layout = QHBoxLayout()
-        left = QVBoxLayout(); left.addWidget(QLabel("Acc (g):"))
+        data_layout.setSpacing(8)
+        left = QVBoxLayout(); left.addWidget(self._label("Acc (g):"))
         self.label_ax = QLabel("ax: ---")
         self.label_ay = QLabel("ay: ---")
         self.label_az = QLabel("az: ---")
         left.addWidget(self.label_ax); left.addWidget(self.label_ay); left.addWidget(self.label_az)
-        mid = QVBoxLayout(); mid.addWidget(QLabel("Gyro (dps):"))
+        mid = QVBoxLayout(); mid.addWidget(self._label("Gyro (dps):"))
         self.label_gx = QLabel("gx: ---"); self.label_gy = QLabel("gy: ---"); self.label_gz = QLabel("gz: ---")
         mid.addWidget(self.label_gx); mid.addWidget(self.label_gy); mid.addWidget(self.label_gz)
-        right = QVBoxLayout(); right.addWidget(QLabel("Orientation (°):"))
-        self.label_roll = QLabel("Roll: ---"); self.label_pitch = QLabel("Pitch: ---"); self.label_yaw = QLabel("Yaw: ---")
+        right = QVBoxLayout(); right.addWidget(self._label("Orientation (°):"))
+        self.label_roll = QLabel(tr("Roll: ---")); self.label_pitch = QLabel(tr("Pitch: ---")); self.label_yaw = QLabel(tr("Yaw: ---"))
+        self._text_bindings.append((self.label_roll, "Roll: ---", "setText"))
+        self._text_bindings.append((self.label_pitch, "Pitch: ---", "setText"))
+        self._text_bindings.append((self.label_yaw, "Yaw: ---", "setText"))
         right.addWidget(self.label_roll); right.addWidget(self.label_pitch); right.addWidget(self.label_yaw)
         data_layout.addLayout(left); data_layout.addLayout(mid); data_layout.addLayout(right)
         data_group.setLayout(data_layout)
         layout.addWidget(data_group)
 
-        log_group = QGroupBox("IMU Data Log")
+        log_group = QGroupBox(tr("IMU Data Log"))
+        self._text_bindings.append((log_group, "IMU Data Log", "setTitle"))
         log_layout = QVBoxLayout()
+        log_layout.setSpacing(6)
         self.imu_log_text = QPlainTextEdit()
         self.imu_log_text.setReadOnly(True)
         self.imu_log_text.setMaximumBlockCount(1000)
         self.imu_log_text.setFont(QFont("Courier New", 9))
         btn_layout = QHBoxLayout()
-        self.clear_log_btn = QPushButton("Clear Log")
-        self.save_log_btn = QPushButton("Save Log to CSV")
-        self.logging_cb = QCheckBox("Auto Log")
+        btn_layout.setSpacing(6)
+        self.clear_log_btn = self._bind_text(QPushButton(), "Clear Log")
+        self.save_log_btn = self._bind_text(QPushButton(), "Save Log to CSV")
+        self.logging_cb = QCheckBox(tr("Auto Log"))
+        self._text_bindings.append((self.logging_cb, "Auto Log", "setText"))
         self.logging_cb.setChecked(True)
         btn_layout.addWidget(self.logging_cb)
         btn_layout.addWidget(self.clear_log_btn)
@@ -548,13 +809,15 @@ class MainWindow(QMainWindow):
         log_group.setLayout(log_layout)
         layout.addWidget(log_group)
 
-        debug_group = QGroupBox("IMU Debug Data")
+        debug_group = QGroupBox(tr("IMU Debug Data"))
+        self._text_bindings.append((debug_group, "IMU Debug Data", "setTitle"))
         debug_layout = QVBoxLayout()
+        debug_layout.setSpacing(6)
         self.imu_debug_text = QPlainTextEdit()
         self.imu_debug_text.setReadOnly(True)
         self.imu_debug_text.setMaximumHeight(120)
         self.imu_debug_text.setFont(QFont("Courier New", 9))
-        copy_btn = QPushButton("Copy Current IMU Data")
+        copy_btn = self._bind_text(QPushButton(), "Copy Current IMU Data")
         copy_btn.clicked.connect(self.copy_imu_data)
         debug_layout.addWidget(self.imu_debug_text)
         debug_layout.addWidget(copy_btn)
@@ -573,7 +836,7 @@ class MainWindow(QMainWindow):
 
     # ---------- 通信和数据处理 ----------
     def update_interface_visibility(self):
-        is_serial = self.interface_combo.currentText() == "Serial (UART/RS485)"
+        is_serial = self.interface_combo.currentData() == "serial"
         self.serial_port_combo.setEnabled(is_serial)
         self.refresh_ports_btn.setEnabled(is_serial)
         self.baudrate_combo.setEnabled(is_serial)
@@ -599,16 +862,16 @@ class MainWindow(QMainWindow):
             self.connect_device()
 
     def connect_device(self):
-        if self.interface_combo.currentText() == "Serial (UART/RS485)":
+        if self.interface_combo.currentData() == "serial":
             port = self.serial_port_combo.currentText()
             if not port:
-                QMessageBox.warning(self,"Error","No serial port")
+                QMessageBox.warning(self, tr("Error"), tr("No serial port"))
                 return
             baud = int(self.baudrate_combo.currentText())
             backend = SerialBackend(port, baud)
         else:
             if not CAN_AVAILABLE:
-                QMessageBox.critical(self,"Error","python-can not installed")
+                QMessageBox.critical(self, tr("Error"), tr("python-can not installed"))
                 return
             channel = self.can_channel_edit.text()
             bustype = self.can_bustype_combo.currentText()
@@ -619,9 +882,10 @@ class MainWindow(QMainWindow):
         backend.error_occurred.connect(self.on_comm_error)
         backend.start()
         self.comm_backend = backend
-        self.connect_btn.setText("Disconnect")
+        self.connect_btn.setText(tr("Disconnect"))
         self.detect_btn.setEnabled(True)
-        self.status_label.setText("Connected")
+        self.status_label.setText(tr("Connected"))
+        self._refresh_status_color()
 
         if self.preview_auto_cb.isChecked():
             self.start_auto_refresh()
@@ -637,13 +901,14 @@ class MainWindow(QMainWindow):
                 pass
             self.comm_backend.stop()
             self.comm_backend = None
-        self.connect_btn.setText("Connect")
+        self.connect_btn.setText(tr("Connect"))
         self.detect_btn.setEnabled(False)
-        self.status_label.setText("Not connected")
+        self.status_label.setText(tr("Not connected"))
+        self._refresh_status_color()
         self.motor_id = None
-        self.motor_id_label.setText("None")
+        self.motor_id_label.setText(tr("None"))
         self.motor_id_combo.clear()
-        self.motor_id_combo.addItem("None")
+        self.motor_id_combo.addItem(tr("None"), None)
         self.imu_poll_cb.setChecked(False)
 
     def send_command(self, func2, func3, data1=0, data2=0, data3=0, data4=0, motor_id=0):
@@ -664,7 +929,7 @@ class MainWindow(QMainWindow):
         if packet.func2 == 0x00 and packet.func3 == 0x00:
             self.handle_detect_response(packet)
         elif packet.func2 == 0x01:
-            self.handle_mode_response(packet)
+            self.handle_mode_response(packet.data1.as_uint32())
         elif packet.func2 == 0x02:
             self.handle_pole_pair_response(packet)
         elif packet.func2 == 0x10:
@@ -729,20 +994,22 @@ class MainWindow(QMainWindow):
         self.detected_ids = ids
         self.motor_id_combo.clear()
         if ids:
-            self.motor_id_combo.addItems([str(i) for i in ids])
+            for i in ids:
+                self.motor_id_combo.addItem(str(i), i)
             self.motor_id = ids[0]
             self.motor_id_label.setText(str(ids[0]))
-            QMessageBox.information(self, "Detect", f"Detected IDs: {ids}")
+            QMessageBox.information(self, tr("Detect"),
+                                    tr("Detected IDs: {}").format(ids))
         else:
-            QMessageBox.warning(self, "Detect", "No motor found")
+            QMessageBox.warning(self, tr("Detect"), tr("No motor found"))
 
     def set_motor_mode(self):
-        mode_map = {"Stop":0,"Self-test":1,"Calibration":2,"Open-loop":3,
-                    "Current loop":4,"Speed loop":5,"Position loop":6}
-        mode = mode_map[self.mode_combo.currentText()]
+        mode = self.mode_combo.currentData()
+        if mode is None:
+            return
         mid = self.get_current_motor_id()
         if mid == 0:
-            QMessageBox.warning(self,"Warning","No motor ID")
+            QMessageBox.warning(self, tr("Warning"), tr("No motor ID"))
             return
         self.send_command(0x01, 0x01, data1=mode, motor_id=mid)
 
@@ -752,14 +1019,13 @@ class MainWindow(QMainWindow):
             return
         self.send_command(0x01, 0x00, motor_id=mid)
 
-    def handle_mode_response(self, packet):
-        mode = packet.data1.as_uint32()
-        names = ["Stop","Self-test","Calibration","Open-loop",
-                 "Current loop","Speed loop","Position loop"]
-        if 0 <= mode < len(names):
-            idx = self.mode_combo.findText(names[mode])
-            if idx >=0:
-                self.mode_combo.setCurrentIndex(idx)
+    def handle_mode_response(self, mode):
+        """Select the combo entry matching the mode code (itemData based, language independent)."""
+        if mode is None:
+            return
+        idx = self.mode_combo.findData(mode)
+        if idx >= 0:
+            self.mode_combo.setCurrentIndex(idx)
 
     def get_motor_parameters(self):
         mid = self.get_current_motor_id()
@@ -796,7 +1062,7 @@ class MainWindow(QMainWindow):
     def get_motor_speed(self):
         mid = self.get_current_motor_id()
         if mid == 0:
-            QMessageBox.warning(self, "Warning", "No motor ID selected")
+            QMessageBox.warning(self, tr("Warning"), tr("No motor ID selected"))
             return
         self.send_command(0x32, 0x00, motor_id=mid)
 
@@ -887,12 +1153,13 @@ class MainWindow(QMainWindow):
         self.last_position_deg = motor_position_deg
         self.motor_preview.set_angle(actual_angle)
         tot, mod = compute_rotations_and_mod(actual_angle)
-        self.actual_angle_label.setText(f"Actual Angle: {actual_angle:.1f}°  (Rot: {tot}, Mod: {mod:.1f}°)")
+        self.actual_angle_label.setText(
+            tr("Actual Angle: {}°  (Rot: {}, Mod: {}°)").format(actual_angle, tot, mod))
 
     def toggle_polling(self, enabled):
         if enabled:
             if self.motor_id is None:
-                QMessageBox.warning(self,"Polling","Detect motor ID first")
+                QMessageBox.warning(self, tr("Polling"), tr("Detect motor ID first"))
                 self.poll_checkbox.setChecked(False)
                 return
             self.poll_enabled = True
@@ -957,7 +1224,7 @@ class MainWindow(QMainWindow):
         speed = packet.data1.as_float()
         self.last_speed_rpm = speed
         if hasattr(self, 'speed_label'):
-            self.speed_label.setText(f"Motor Speed: {speed:.1f} rpm")
+            self.speed_label.setText(tr("Motor Speed: {} rpm").format(round(speed, 1)))
         self.data_history['time'].append(self.plot_index)
         self.data_history['speed'].append(speed)
         if self.poll_type == "speed":
@@ -966,9 +1233,10 @@ class MainWindow(QMainWindow):
     def handle_position(self, packet):
         pos = packet.data1.as_float()
         tot, mod = compute_rotations_and_mod(pos)
-        self.total_rotations_label.setText(f"Total rotations: {tot}")
-        self.mod_angle_label.setText(f"Mod angle (0-360°): {mod:.2f}°")
-        self.raw_angle_label.setText(f"Raw Motor Angle: {pos:.1f}°  (Rot: {tot}, Mod: {mod:.1f}°)")
+        self.total_rotations_label.setText(tr("Total rotations: {}").format(tot))
+        self.mod_angle_label.setText(tr("Mod angle (0-360°): {}°").format(round(mod, 2)))
+        self.raw_angle_label.setText(
+            tr("Raw Motor Angle: {}°  (Rot: {}, Mod: {}°)").format(round(pos, 1), tot, round(mod, 1)))
         self.update_preview_angle(pos)
         self.data_history['time'].append(self.plot_index)
         self.data_history['position'].append(pos)
@@ -1016,17 +1284,18 @@ class MainWindow(QMainWindow):
                     writer.writerow(row)
 
     def on_comm_error(self, msg):
-        self.status_label.setText(f"Error: {msg}")
-        QMessageBox.critical(self, "Comm Error", msg)
+        self.status_label.setText(tr("Error: {}").format(msg))
+        self._refresh_status_color()
+        QMessageBox.critical(self, tr("Comm Error"), msg)
         self.disconnect()
 
     def get_current_motor_id(self):
-        text = self.motor_id_combo.currentText()
-        if text == "None" or not text:
+        data = self.motor_id_combo.currentData()
+        if data is None:
             return 0
         try:
-            return int(text)
-        except:
+            return int(data)
+        except (TypeError, ValueError):
             return 0
 
     def start_auto_refresh(self):
@@ -1086,7 +1355,7 @@ class MainWindow(QMainWindow):
 
     def on_motor_id_changed(self):
         if hasattr(self, 'speed_label'):
-            self.speed_label.setText("Motor Speed: --- rpm")
+            self.speed_label.setText(tr("Motor Speed: --- rpm"))
         if self.auto_refresh_enabled:
             self.is_busy = False
 
@@ -1195,11 +1464,14 @@ class MainWindow(QMainWindow):
                 self.gyro_bias = [avg_x, avg_y, avg_z]
                 self.calibrating_gyro = False
                 print(f"[IMU] Calibration done. Bias: {avg_x:.2f}, {avg_y:.2f}, {avg_z:.2f} dps")
-                self.status_label.setText(f"IMU ready (bias: {avg_x:.1f}, {avg_y:.1f}, {avg_z:.1f})")
+                self.status_label.setText(
+                    tr("IMU ready (bias: {}, {}, {})").format(
+                        round(avg_x, 1), round(avg_y, 1), round(avg_z, 1)))
                 self.filter = ComplementaryFilter(dt=0.02, alpha=0.92, max_delta_deg=5.0)
                 self.calib_buffer.clear()
             else:
-                self.status_label.setText(f"Calibrating IMU... {self.calib_samples}/{self.calib_max_samples}")
+                self.status_label.setText(
+                    tr("Calibrating IMU... {}/{}").format(self.calib_samples, self.calib_max_samples))
             return
 
         # 减去零偏
@@ -1222,9 +1494,12 @@ class MainWindow(QMainWindow):
         roll_deg = math.degrees(self.filter.roll)
         pitch_deg = math.degrees(self.filter.pitch)
         yaw_deg = math.degrees(self.filter.yaw)
-        self.label_roll.setText(f"Roll: {roll_deg:.1f}°")
-        self.label_pitch.setText(f"Pitch: {pitch_deg:.1f}°")
-        self.label_yaw.setText(f"Yaw: {yaw_deg:.1f}°")
+        self.last_roll_deg = roll_deg
+        self.last_pitch_deg = pitch_deg
+        self.last_yaw_deg = yaw_deg
+        self.label_roll.setText(tr("Roll: {}°").format(round(roll_deg, 1)))
+        self.label_pitch.setText(tr("Pitch: {}°").format(round(pitch_deg, 1)))
+        self.label_yaw.setText(tr("Yaw: {}°").format(round(yaw_deg, 1)))
 
         self.imu_3d_view.set_orientation_quat(q)
 
@@ -1236,37 +1511,50 @@ class MainWindow(QMainWindow):
     def update_imu_debug_text(self):
         if not hasattr(self, 'imu_debug_text'):
             return
-        text = (f"Timestamp: {time.strftime('%H:%M:%S')}\n"
-                f"Accel (g): ax={self.imu_data['ax']:.4f}, ay={self.imu_data['ay']:.4f}, az={self.imu_data['az']:.4f}\n"
-                f"Gyro raw (dps): {self.imu_data['gx']:.1f}, {self.imu_data['gy']:.1f}, {self.imu_data['gz']:.1f}\n"
-                f"Gyro bias (dps): {self.gyro_bias[0]:.1f}, {self.gyro_bias[1]:.1f}, {self.gyro_bias[2]:.1f}\n"
-                f"Gyro cal (dps): {self.imu_data['gx']-self.gyro_bias[0]:.1f}, {self.imu_data['gy']-self.gyro_bias[1]:.1f}, {self.imu_data['gz']-self.gyro_bias[2]:.1f}\n"
-                f"Temperature: {self.imu_data['temp']:.1f}°C\n"
-                f"Orientation (deg): roll={self.label_roll.text().split(':')[1].strip()}, "
-                f"pitch={self.label_pitch.text().split(':')[1].strip()}, "
-                f"yaw={self.label_yaw.text().split(':')[1].strip()}\n"
-                f"Raw LSBs: ax={getattr(self,'ax_raw',0)}, ay={getattr(self,'ay_raw',0)}, az={getattr(self,'az_raw',0)}, "
-                f"gx={getattr(self,'gx_raw',0)}, gy={getattr(self,'gy_raw',0)}, gz={getattr(self,'gz_raw',0)}")
-        self.imu_debug_text.setPlainText(text)
+
+        def line(label, value):
+            # 译文本身可能已带冒号（含全角），避免出现重复或半角混排
+            label = tr(label)
+            sep = "" if label.endswith((':', '：')) else ":"
+            return label + sep + " " + value + "\n"
+
+        text = (line("Timestamp:", time.strftime('%H:%M:%S'))
+                + line("Accel (g):", "ax={:.4f}, ay={:.4f}, az={:.4f}".format(
+                    self.imu_data['ax'], self.imu_data['ay'], self.imu_data['az']))
+                + line("Gyro raw (dps):", "{:.1f}, {:.1f}, {:.1f}".format(
+                    self.imu_data['gx'], self.imu_data['gy'], self.imu_data['gz']))
+                + line("Gyro bias (dps):", "{:.1f}, {:.1f}, {:.1f}".format(
+                    self.gyro_bias[0], self.gyro_bias[1], self.gyro_bias[2]))
+                + line("Gyro cal (dps):", "{:.1f}, {:.1f}, {:.1f}".format(
+                    self.imu_data['gx'] - self.gyro_bias[0],
+                    self.imu_data['gy'] - self.gyro_bias[1],
+                    self.imu_data['gz'] - self.gyro_bias[2]))
+                + line("Temperature:", "{:.1f}°C".format(self.imu_data['temp']))
+                + line("Orientation (deg):", "roll={:.1f}, pitch={:.1f}, yaw={:.1f}".format(
+                    self.last_roll_deg, self.last_pitch_deg, self.last_yaw_deg))
+                + line("Raw LSBs:", "ax={}, ay={}, az={}, gx={}, gy={}, gz={}".format(
+                    getattr(self, 'ax_raw', 0), getattr(self, 'ay_raw', 0), getattr(self, 'az_raw', 0),
+                    getattr(self, 'gx_raw', 0), getattr(self, 'gy_raw', 0), getattr(self, 'gz_raw', 0))))
+        self.imu_debug_text.setPlainText(text.rstrip("\n"))
 
     def copy_imu_data(self):
         text = self.imu_debug_text.toPlainText()
         if text:
             QApplication.clipboard().setText(text)
-            self.status_label.setText("IMU data copied to clipboard")
+            self.status_label.setText(tr("IMU data copied to clipboard"))
 
     def clear_imu_log(self):
         self.imu_log_text.clear()
 
     def save_imu_log_to_csv(self):
-        filename, _ = QFileDialog.getSaveFileName(self, "Save IMU Log", "", "CSV Files (*.csv)")
+        filename, _ = QFileDialog.getSaveFileName(self, tr("Save IMU Log"), "", tr("CSV Files (*.csv)"))
         if filename:
             try:
                 with open(filename, 'w') as f:
                     f.write(self.imu_log_text.toPlainText())
-                QMessageBox.information(self, "Saved", f"Log saved to {filename}")
+                QMessageBox.information(self, tr("Saved"), tr("Log saved to {}").format(filename))
             except Exception as e:
-                QMessageBox.critical(self, "Error", str(e))
+                QMessageBox.critical(self, tr("Error"), str(e))
 
     def log_imu_data(self, ax, ay, az, gx, gy, gz, roll, pitch, yaw):
         timestamp = time.strftime("%H:%M:%S") + f".{int(time.time()*1000)%1000:03d}"
@@ -1285,13 +1573,13 @@ class MainWindow(QMainWindow):
             self.calib_buffer = []
             self.gyro_bias = [0.0, 0.0, 0.0]
             self.filter = None
-            self.status_label.setText("IMU calibrating... Keep device still")
+            self.status_label.setText(tr("IMU calibrating... Keep device still"))
             self.imu_poll_timer.start(self.imu_poll_interval.value())
             self.request_imu_data()
         else:
             self.imu_poll_timer.stop()
             self.calibrating_gyro = False
-            self.status_label.setText("IMU polling stopped")
+            self.status_label.setText(tr("IMU polling stopped"))
 
     def update_imu_poll_interval(self):
         if self.imu_poll_enabled:
@@ -1301,41 +1589,43 @@ class MainWindow(QMainWindow):
     def scan_asset_models(self):
         import glob
         self.model_combo.blockSignals(True)
-        current = self.model_combo.currentText()
+        current = self.model_combo.currentData()
         self.model_combo.clear()
-        self.model_combo.addItem("Default Cube")
+        self.model_combo.addItem(tr(DEFAULT_CUBE), DEFAULT_CUBE)
         asset_dir = "./asset"
         if not os.path.exists(asset_dir):
             os.makedirs(asset_dir)
         for ext in ('.stl','.obj','.ply','.step','.stp'):
             for f in glob.glob(os.path.join(asset_dir, f"*{ext}")):
-                self.model_combo.addItem(f)
-        idx = self.model_combo.findText(current)
+                self.model_combo.addItem(f, f)
+        idx = self.model_combo.findData(current)
         if idx>=0:
             self.model_combo.setCurrentIndex(idx)
         self.model_combo.blockSignals(False)
 
     def browse_model_file(self):
-        filepath, _ = QFileDialog.getOpenFileName(self, "Select 3D Model", "./asset", "3D Models (*.stl *.obj *.ply *.step *.stp)")
+        filepath, _ = QFileDialog.getOpenFileName(self, tr("Select 3D Model"), "./asset", tr("3D Models (*.stl *.obj *.ply *.step *.stp)"))
         if filepath:
             self.load_model_to_view(filepath)
-            self.model_combo.addItem(filepath)
-            self.model_combo.setCurrentText(filepath)
+            self.model_combo.addItem(filepath, filepath)
+            self.model_combo.setCurrentIndex(self.model_combo.findData(filepath))
 
     def reset_to_cube(self):
         self.imu_3d_view.set_default_cube()
-        self.model_combo.setCurrentText("Default Cube")
+        idx = self.model_combo.findData(DEFAULT_CUBE)
+        if idx >= 0:
+            self.model_combo.setCurrentIndex(idx)
 
     def load_model_to_view(self, filepath):
         if not TRIMESH_AVAILABLE:
-            QMessageBox.critical(self, "Missing Library", "trimesh not installed")
+            QMessageBox.critical(self, tr("Missing Library"), tr("trimesh not installed"))
             return
         if not self.imu_3d_view.load_model_from_file(filepath):
-            QMessageBox.warning(self, "Load Failed", f"Failed to load {filepath}")
+            QMessageBox.warning(self, tr("Load Failed"), tr("Failed to load {}").format(filepath))
 
     def send_manual_command(self):
         if not self.comm_backend:
-            QMessageBox.warning(self, "Error", "Not connected")
+            QMessageBox.warning(self, tr("Error"), tr("Not connected"))
             return
         hex_str = self.manual_cmd_edit.toPlainText().strip()
         if not hex_str:
@@ -1344,7 +1634,7 @@ class MainWindow(QMainWindow):
         try:
             data = bytes.fromhex(hex_str)
         except ValueError:
-            QMessageBox.warning(self, "Error", "Invalid hex string")
+            QMessageBox.warning(self, tr("Error"), tr("Invalid hex string"))
             return
         self.comm_backend.send_raw(data)
         hex_repr = data.hex().upper()
@@ -1370,11 +1660,11 @@ class MainWindow(QMainWindow):
         """Update the config status label."""
         if message:
             text = message
-            color = "green" if success else "red"
+            color = self.colors["status_ok"] if success else self.colors["status_error"]
         else:
             name = self.config_manager.current_name
-            text = f"Active: {name}"
-            color = "green"
+            text = tr("Active: {}").format(name)
+            color = self.colors["status_ok"]
         self.config_status_label.setText(text)
         self.config_status_label.setStyleSheet(f"color: {color}; font-style: italic;")
 
@@ -1382,23 +1672,23 @@ class MainWindow(QMainWindow):
         """Load the selected config from the dropdown and apply to GUI."""
         file = self.config_combo.currentText()
         if not file:
-            QMessageBox.warning(self, "No Config", "No config file selected.")
+            QMessageBox.warning(self, tr("No Config"), tr("No config file selected."))
             return
         path = os.path.join(self.config_manager.config_dir, file)
         try:
             self.config_manager.load_and_apply(self, path)
             self._update_config_status(True)
-            QMessageBox.information(self, "Config", f"Loaded: {file}")
+            QMessageBox.information(self, tr("Config"), tr("Loaded: {}").format(file))
         except Exception as e:
-            self._update_config_status(False, f"Failed to load: {e}")
-            QMessageBox.critical(self, "Error", str(e))
+            self._update_config_status(False, tr("Failed to load: {}").format(e))
+            QMessageBox.critical(self, tr("Error"), str(e))
 
     def on_import_config(self):
         """Import a config file from anywhere on disk into the config dir,
         then load and apply it."""
         src, _ = QFileDialog.getOpenFileName(
-            self, "Import Config", "",
-            "JSON Files (*.json);;All Files (*)")
+            self, tr("Import Config"), "",
+            tr("JSON Files (*.json);;All Files (*)"))
         if not src:
             return
         try:
@@ -1411,17 +1701,17 @@ class MainWindow(QMainWindow):
             if idx >= 0:
                 self.config_combo.setCurrentIndex(idx)
             self._update_config_status(True)
-            QMessageBox.information(self, "Imported",
-                                    f"Imported and loaded: {imported_name}")
+            QMessageBox.information(self, tr("Imported"),
+                                    tr("Imported and loaded: {}").format(imported_name))
         except Exception as e:
-            self._update_config_status(False, f"Import failed: {e}")
-            QMessageBox.critical(self, "Error", str(e))
+            self._update_config_status(False, tr("Import failed: {}").format(e))
+            QMessageBox.critical(self, tr("Error"), str(e))
 
     def on_save_config(self):
         """Save current GUI settings as a new config file, then set it as active."""
         default_dir = self.config_manager.config_dir
         filename, _ = QFileDialog.getSaveFileName(
-            self, "Save Config As", default_dir, "JSON (*.json)")
+            self, tr("Save Config As"), default_dir, tr("JSON (*.json)"))
         if not filename:
             return
         try:
@@ -1433,7 +1723,7 @@ class MainWindow(QMainWindow):
             if idx >= 0:
                 self.config_combo.setCurrentIndex(idx)
             self._update_config_status(True)
-            QMessageBox.information(self, "Saved", f"Saved to {saved_name}")
+            QMessageBox.information(self, tr("Saved"), tr("Saved to {}").format(saved_name))
         except Exception as e:
-            self._update_config_status(False, f"Save failed: {e}")
+            self._update_config_status(False, tr("Save failed: {}").format(e))
             QMessageBox.critical(self, "Error", str(e))

@@ -3,6 +3,8 @@
 import os
 import json
 
+import settings
+
 
 class ConfigManager:
     """Manages motor configuration JSON files: load, save, import, export."""
@@ -30,10 +32,15 @@ class ConfigManager:
     # ── file listing ──────────────────────────────────────────────
 
     def list_configs(self):
-        """Return sorted list of .json filenames in the config directory."""
+        """Return sorted list of .json filenames in the config directory.
+
+        The UI settings file (config/settings.json) is excluded so it does not
+        show up as a motor configuration.
+        """
         if not os.path.exists(self.config_dir):
             return []
-        files = [f for f in os.listdir(self.config_dir) if f.endswith('.json')]
+        files = [f for f in os.listdir(self.config_dir)
+                 if f.endswith('.json') and f != settings.SETTINGS_FILE]
         files.sort()
         return files
 
