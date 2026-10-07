@@ -29,6 +29,7 @@ Motor GUI for motor control, monitoring, tuning, and IMU visualization.
 - Manual hex command sending
 - IMU 3D visualization
 - Optional custom 3D model loading
+- Stillness-gated gyro calibration and complementary filter attitude estimation
 - Light and dark themes
 - UI languages: English, 简体中文, 繁體中文
 
@@ -213,6 +214,26 @@ The Motor Control and PID Tuning tabs are dense. When a tab does not fit
 vertically it is placed inside a scroll area, and the window is clamped to the
 available screen area on startup. Maximise the window, or scroll the affected
 tab.
+
+### IMU 3D model does not move
+
+The 3D model follows the gyroscope, but the gyro zero bias is measured on
+startup and it must be measured while the device is completely still.
+
+- Press **Start Polling** and leave the device still for the first 2-5 seconds
+  (the status bar shows `Calibrating IMU... n/30`).
+- Samples taken while the device is moving are discarded, so calibration simply
+  takes longer instead of learning a wrong bias.
+- Rotation is always applied to the model, even while calibration is still
+  running, so the model responds from the first packet.
+- If the model drifts or does not move, stop polling and start it again with the
+  device at rest.
+
+### IMU axes do not match the physical board
+
+`decode_imu_packet()` in `gui_tabs/main_window.py` maps the sensor frame
+straight through. If roll/pitch/yaw appear swapped or inverted, uncomment the
+alternative mapping block there and adjust the signs for your mounting.
 
 ### Wrong theme or language after launch
 

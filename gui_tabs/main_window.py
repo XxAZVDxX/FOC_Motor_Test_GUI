@@ -52,10 +52,13 @@ TAB_KEYS = ["Connection", "Motor Control", "PID Tuning", "Real-time Data",
 
 # ==================== 互补滤波器（带限幅和衰减） ====================
 class ComplementaryFilter:
-    def __init__(self, dt=0.02, alpha=0.92, max_delta_deg=5.0):
+    def __init__(self, dt=0.02, alpha=0.92, max_rate_dps=1000.0, accel_gate_dps=20.0):
         self.dt = dt
         self.alpha = alpha
-        self.max_delta_rad = math.radians(max_delta_deg)
+        # 积分限幅按角速度而不是按帧，换轮询周期时行为保持一致
+        self.max_rate_rad = math.radians(max_rate_dps)
+        # 只有角速度低于该阈值时才用加速度计修正姿态
+        self.accel_gate_dps = accel_gate_dps
         self.roll = 0.0
         self.pitch = 0.0
         self.yaw = 0.0
@@ -65,15 +68,18 @@ class ComplementaryFilter:
         acc_roll = math.atan2(ay, az)
         acc_pitch = math.atan2(-ax, math.sqrt(ay*ay + az*az))
         # 陀螺仪积分，并限幅
+        cap = self.max_rate_rad * self.dt
         delta_r = math.radians(gx) * self.dt
         delta_p = math.radians(gy) * self.dt
         delta_y = math.radians(gz) * self.dt
-        self.roll  += max(-self.max_delta_rad, min(self.max_delta_rad, delta_r))
-        self.pitch += max(-self.max_delta_rad, min(self.max_delta_rad, delta_p))
-        self.yaw   += max(-self.max_delta_rad, min(self.max_delta_rad, delta_y))
-        # 互补滤波
-        self.roll  = self.alpha * self.roll  + (1 - self.alpha) * acc_roll
-        self.pitch = self.alpha * self.pitch + (1 - self.alpha) * acc_pitch
+        self.roll  += max(-cap, min(cap, delta_r))
+        self.pitch += max(-cap, min(cap, delta_p))
+        self.yaw   += max(-cap, min(cap, delta_y))
+        # 互补滤波：转动时加速度计读数含离心力，若每帧都融合会把姿态拉回，
+        # 因此仅在角速度很低（接近静止）时才用它修正 roll/pitch
+        if math.hypot(gx, gy) < self.accel_gate_dps:
+            self.roll  = self.alpha * self.roll  + (1 - self.alpha) * acc_roll
+            self.pitch = self.alpha * self.pitch + (1 - self.alpha) * acc_pitch
         # yaw 依赖陀螺仪，加轻微衰减防止长时间漂移
         self.yaw *= 0.9995
         # 转为四元数
@@ -164,7 +170,9 @@ class MainWindow(QMainWindow):
         self.last_pitch_deg = 0.0
         self.last_yaw_deg = 0.0
         self.calib_samples = 0
-        self.calib_max_samples = 300          # 采集300个样本，约6-10秒
+        self.calib_max_samples = 100          # 100 个样本，约 2-5 秒
+        self.calib_min_samples = 30           # 至少累计这么多静止样本才收敛
+        self.calib_motion_dps = 8.0           # 超过该角速度视为在动，丢弃该样本
         self.calib_buffer = []
 
         self.config_manager = ConfigManager("./config")
@@ -1453,26 +1461,31 @@ class MainWindow(QMainWindow):
         self.label_gy.setText(f"gy: {gy:.1f} dps")
         self.label_gz.setText(f"gz: {gz:.1f} dps")
 
-        # 自动零偏校准
+        # 自动零偏校准：只在设备静止时采样，避免把转动当成零偏
         if self.calibrating_gyro:
-            self.calib_buffer.append((gx_gui, gy_gui, gz_gui))
             self.calib_samples += 1
-            if self.calib_samples >= self.calib_max_samples:
-                avg_x = sum(v[0] for v in self.calib_buffer) / self.calib_samples
-                avg_y = sum(v[1] for v in self.calib_buffer) / self.calib_samples
-                avg_z = sum(v[2] for v in self.calib_buffer) / self.calib_samples
+            if math.hypot(gx_gui, gy_gui, gz_gui) < self.calib_motion_dps:
+                self.calib_buffer.append((gx_gui, gy_gui, gz_gui))
+            enough_samples = len(self.calib_buffer) >= self.calib_min_samples
+            if enough_samples or self.calib_samples >= self.calib_max_samples:
+                n = len(self.calib_buffer)
+                if n:
+                    avg_x = sum(v[0] for v in self.calib_buffer) / n
+                    avg_y = sum(v[1] for v in self.calib_buffer) / n
+                    avg_z = sum(v[2] for v in self.calib_buffer) / n
+                else:
+                    avg_x = avg_y = avg_z = 0.0
                 self.gyro_bias = [avg_x, avg_y, avg_z]
                 self.calibrating_gyro = False
                 print(f"[IMU] Calibration done. Bias: {avg_x:.2f}, {avg_y:.2f}, {avg_z:.2f} dps")
                 self.status_label.setText(
                     tr("IMU ready (bias: {}, {}, {})").format(
                         round(avg_x, 1), round(avg_y, 1), round(avg_z, 1)))
-                self.filter = ComplementaryFilter(dt=0.02, alpha=0.92, max_delta_deg=5.0)
                 self.calib_buffer.clear()
             else:
                 self.status_label.setText(
-                    tr("Calibrating IMU... {}/{}").format(self.calib_samples, self.calib_max_samples))
-            return
+                    tr("Calibrating IMU... {}/{}").format(
+                        len(self.calib_buffer), self.calib_min_samples))
 
         # 减去零偏
         gx_cal = gx_gui - self.gyro_bias[0]
@@ -1481,12 +1494,13 @@ class MainWindow(QMainWindow):
 
         current_time = time.time()
         dt = current_time - self.last_imu_time
-        if dt <= 0.001 or dt > 0.1:
-            dt = 0.02
+        # 单次积分跨度上限 0.1s，超出部分不再累积，避免丢包后姿态跳变
+        dt = max(0.001, min(0.1, dt))
         self.last_imu_time = current_time
 
+        # 校准期间也持续积分，3D 模型从第一帧起就能跟随转动
         if self.filter is None:
-            return
+            self.filter = ComplementaryFilter(dt=0.02, alpha=0.92)
 
         self.filter.dt = dt
         q = self.filter.update(gx_cal, gy_cal, gz_cal, ax_gui, ay_gui, az_gui)
@@ -1572,7 +1586,9 @@ class MainWindow(QMainWindow):
             self.calib_samples = 0
             self.calib_buffer = []
             self.gyro_bias = [0.0, 0.0, 0.0]
-            self.filter = None
+            # 姿态从零开始，但保留 filter 实例，使模型在校准期间即可跟随转动
+            self.filter = ComplementaryFilter(dt=0.02, alpha=0.92)
+            self.last_imu_time = time.time()
             self.status_label.setText(tr("IMU calibrating... Keep device still"))
             self.imu_poll_timer.start(self.imu_poll_interval.value())
             self.request_imu_data()
