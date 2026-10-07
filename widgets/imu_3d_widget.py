@@ -6,6 +6,7 @@ from PyQt5.QtWidgets import QMessageBox
 import pyqtgraph.opengl as gl
 from pyqtgraph.opengl import GLViewWidget, GLMeshItem, MeshData, GLGridItem
 import pyqtgraph as pg
+from pyqtgraph.Qt import QtGui
 
 try:
     import trimesh
@@ -88,3 +89,30 @@ class IMU3DWidget(GLViewWidget):
             self.current_mesh_item.rotate(yaw_deg, 0, 0, 1)
             self.current_mesh_item.rotate(pitch_deg, 0, 1, 0)
             self.current_mesh_item.rotate(roll_deg, 1, 0, 0)
+
+    def set_orientation_quat(self, q):
+        """
+        使用四元数设置模型旋转
+        q: [w, x, y, z]
+        """
+        if self.current_mesh_item is None:
+            return
+        w, x, y, z = q
+        # 归一化
+        norm = (w*w + x*x + y*y + z*z)**0.5
+        if norm > 0:
+            w /= norm
+            x /= norm
+            y /= norm
+            z /= norm
+        # 构造旋转矩阵 (行主序，用于 QMatrix4x4)
+        m = np.array([
+            [1 - 2*y*y - 2*z*z, 2*x*y - 2*z*w,   2*x*z + 2*y*w,   0],
+            [2*x*y + 2*z*w,     1 - 2*x*x - 2*z*z, 2*y*z - 2*x*w,   0],
+            [2*x*z - 2*y*w,     2*y*z + 2*x*w,   1 - 2*x*x - 2*y*y, 0],
+            [0,                 0,                 0,                 1]
+        ], dtype=float)
+        qmat = QtGui.QMatrix4x4()
+        for i in range(4):
+            qmat.setRow(i, QtGui.QVector4D(m[i][0], m[i][1], m[i][2], m[i][3]))
+        self.current_mesh_item.setTransform(qmat)

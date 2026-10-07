@@ -67,7 +67,7 @@ class SerialBackend(CommBackend):
                 while True:
                     raw_data = self.raw_tx_queue.get_nowait()
                     self.serial.write(raw_data)
-                    self.raw_data_received.emit(raw_data)  # 可选：回显
+                    self.raw_data_received.emit(raw_data)
             except queue.Empty:
                 pass
 
@@ -144,7 +144,7 @@ class CANBackend(CommBackend):
             except queue.Empty:
                 pass
 
-            # 发送原始字节 (同样拆分为3帧)
+            # 发送原始字节
             try:
                 while True:
                     raw_data = self.raw_tx_queue.get_nowait()
@@ -172,12 +172,10 @@ class CANBackend(CommBackend):
                     buffer.extend(msg.data[1:])
                     expected_seq += 1
                     if expected_seq == 3 and len(buffer) >= PACKAGE_SIZE:
-                        # 尝试解析为协议包
                         packet = CommandPacket.parse(buffer[:PACKAGE_SIZE])
                         if packet:
                             self.packet_received.emit(packet)
                         else:
-                            # 不是有效协议包，发射原始数据
                             self.raw_data_received.emit(buffer[:PACKAGE_SIZE])
                         buffer = bytearray()
                         expected_seq = 0

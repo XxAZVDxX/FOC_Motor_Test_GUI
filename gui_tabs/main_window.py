@@ -21,6 +21,48 @@ from comm_backend import SerialBackend, CANBackend, CAN_AVAILABLE
 from widgets.motor_preview import MotorPreviewWidget
 from widgets.imu_3d_widget import IMU3DWidget
 from utils import compute_rotations_and_mod
+from config_manager import ConfigManager
+
+# ==================== 互补滤波器（带限幅和衰减） ====================
+class ComplementaryFilter:
+    def __init__(self, dt=0.02, alpha=0.92, max_delta_deg=5.0):
+        self.dt = dt
+        self.alpha = alpha
+        self.max_delta_rad = math.radians(max_delta_deg)
+        self.roll = 0.0
+        self.pitch = 0.0
+        self.yaw = 0.0
+
+    def update(self, gx, gy, gz, ax, ay, az):
+        # 加速度计计算的姿态（弧度）
+        acc_roll = math.atan2(ay, az)
+        acc_pitch = math.atan2(-ax, math.sqrt(ay*ay + az*az))
+        # 陀螺仪积分，并限幅
+        delta_r = math.radians(gx) * self.dt
+        delta_p = math.radians(gy) * self.dt
+        delta_y = math.radians(gz) * self.dt
+        self.roll  += max(-self.max_delta_rad, min(self.max_delta_rad, delta_r))
+        self.pitch += max(-self.max_delta_rad, min(self.max_delta_rad, delta_p))
+        self.yaw   += max(-self.max_delta_rad, min(self.max_delta_rad, delta_y))
+        # 互补滤波
+        self.roll  = self.alpha * self.roll  + (1 - self.alpha) * acc_roll
+        self.pitch = self.alpha * self.pitch + (1 - self.alpha) * acc_pitch
+        # yaw 依赖陀螺仪，加轻微衰减防止长时间漂移
+        self.yaw *= 0.9995
+        # 转为四元数
+        cy = math.cos(self.yaw * 0.5)
+        sy = math.sin(self.yaw * 0.5)
+        cp = math.cos(self.pitch * 0.5)
+        sp = math.sin(self.pitch * 0.5)
+        cr = math.cos(self.roll * 0.5)
+        sr = math.sin(self.roll * 0.5)
+        q = [
+            cr*cp*cy + sr*sp*sy,
+            sr*cp*cy - cr*sp*sy,
+            cr*sp*cy + sr*cp*sy,
+            cr*cp*sy - sr*sp*cy
+        ]
+        return q
 
 TRIMESH_AVAILABLE = False
 try:
@@ -52,8 +94,8 @@ class MainWindow(QMainWindow):
         self.auto_refresh_enabled = False
         self.is_busy = False
         self.busy_start = 0
-        self.busy_timeout = 150        # ms
-        self.preview_toggle = True      # True=位置, False=速度
+        self.busy_timeout = 150
+        self.preview_toggle = True
 
         self.gear_ratio_num = 1.0
         self.gear_ratio_den = 1.0
@@ -72,16 +114,20 @@ class MainWindow(QMainWindow):
         }
         self.plot_index = 0
 
-        # IMU
-        self.imu_data = {'ax':0,'ay':0,'az':0,'gx':0,'gy':0,'gz':0,'temp':0,'roll':0,'pitch':0,'yaw':0}
+        # IMU 相关 - 自动零偏校准
+        self.imu_data = {'ax':0,'ay':0,'az':0,'gx':0,'gy':0,'gz':0,'temp':0}
         self.last_imu_time = time.time()
         self.imu_poll_timer = QTimer()
         self.imu_poll_timer.timeout.connect(self.request_imu_data)
         self.imu_poll_enabled = False
+        self.filter = None
+        self.calibrating_gyro = False
+        self.gyro_bias = [0.0, 0.0, 0.0]
+        self.calib_samples = 0
+        self.calib_max_samples = 300          # 采集300个样本，约6-10秒
+        self.calib_buffer = []
 
-        self.config_dir = "./config"
-        if not os.path.exists(self.config_dir):
-            os.makedirs(self.config_dir)
+        self.config_manager = ConfigManager("./config")
 
         # 手动命令缓冲区
         self.manual_response_buffer = []
@@ -162,26 +208,41 @@ class MainWindow(QMainWindow):
         widget = QWidget()
         layout = QVBoxLayout(widget)
 
-        # Config
         config_group = QGroupBox("Configuration")
-        cfg_layout = QHBoxLayout()
+        cfg_vlayout = QVBoxLayout()
+
+        # row 1: dropdown + buttons
+        cfg_row1 = QHBoxLayout()
         self.config_combo = QComboBox()
         self.refresh_config_btn = QPushButton("Refresh")
         self.load_config_btn = QPushButton("Load")
-        self.save_config_btn = QPushButton("Save")
-        cfg_layout.addWidget(QLabel("Config:"))
-        cfg_layout.addWidget(self.config_combo)
-        cfg_layout.addWidget(self.refresh_config_btn)
-        cfg_layout.addWidget(self.load_config_btn)
-        cfg_layout.addWidget(self.save_config_btn)
-        config_group.setLayout(cfg_layout)
+        self.import_config_btn = QPushButton("Import…")
+        self.save_as_btn = QPushButton("Save As…")
+        cfg_row1.addWidget(QLabel("Config:"))
+        cfg_row1.addWidget(self.config_combo, 1)
+        cfg_row1.addWidget(self.refresh_config_btn)
+        cfg_row1.addWidget(self.load_config_btn)
+        cfg_row1.addWidget(self.import_config_btn)
+        cfg_row1.addWidget(self.save_as_btn)
+        cfg_vlayout.addLayout(cfg_row1)
+
+        # row 2: status label
+        cfg_row2 = QHBoxLayout()
+        self.config_status_label = QLabel("No config loaded")
+        self.config_status_label.setStyleSheet("color: gray; font-style: italic;")
+        cfg_row2.addWidget(self.config_status_label)
+        cfg_row2.addStretch()
+        cfg_vlayout.addLayout(cfg_row2)
+
+        config_group.setLayout(cfg_vlayout)
         layout.addWidget(config_group)
+
         self.load_config_list()
         self.refresh_config_btn.clicked.connect(self.load_config_list)
         self.load_config_btn.clicked.connect(self.on_load_config)
-        self.save_config_btn.clicked.connect(self.on_save_config)
+        self.import_config_btn.clicked.connect(self.on_import_config)
+        self.save_as_btn.clicked.connect(self.on_save_config)
 
-        # Motor ID
         id_group = QGroupBox("Motor Selection")
         id_layout = QHBoxLayout()
         self.motor_id_combo = QComboBox()
@@ -192,7 +253,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(id_group)
         self.motor_id_combo.currentTextChanged.connect(self.on_motor_id_changed)
 
-        # Mode
         mode_group = QGroupBox("Operating Mode")
         mode_layout = QFormLayout()
         self.mode_combo = QComboBox()
@@ -208,7 +268,6 @@ class MainWindow(QMainWindow):
         mode_group.setLayout(mode_layout)
         layout.addWidget(mode_group)
 
-        # Motor params
         param_group = QGroupBox("Motor Parameters")
         param_layout = QFormLayout()
         self.pole_pair_label = QLabel("---")
@@ -223,7 +282,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(param_group)
         get_params_btn.clicked.connect(self.get_motor_parameters)
 
-        # Targets
         target_group = QGroupBox("Target Values")
         target_layout = QFormLayout()
         self.target_iq = QDoubleSpinBox(); self.target_iq.setRange(-10,10); self.target_iq.setDecimals(3)
@@ -252,7 +310,6 @@ class MainWindow(QMainWindow):
         get_target_btn.clicked.connect(self.get_targets)
         self.get_speed_btn.clicked.connect(self.get_motor_speed)
 
-        # Phase currents
         current_group = QGroupBox("Phase Currents")
         curr_layout = QFormLayout()
         self.label_Ia = QLabel("0.000 A"); self.label_Ia.setStyleSheet("color:#FF0000")
@@ -264,7 +321,6 @@ class MainWindow(QMainWindow):
         current_group.setLayout(curr_layout)
         layout.addWidget(current_group)
 
-        # Auto refresh
         auto_group = QGroupBox("Auto Refresh")
         auto_layout = QHBoxLayout()
         self.auto_refresh_cb = QCheckBox("Enable")
@@ -277,7 +333,6 @@ class MainWindow(QMainWindow):
         auto_layout.addWidget(self.auto_refresh_cb)
         auto_layout.addWidget(QLabel("Interval:"))
         auto_layout.addWidget(self.refresh_interval_spin)
-        # 预览自动刷新复选框
         self.preview_auto_cb = QCheckBox("Auto Refresh Preview")
         self.preview_auto_cb.setChecked(True)
         self.preview_auto_cb.toggled.connect(self.toggle_preview_auto_refresh)
@@ -285,7 +340,6 @@ class MainWindow(QMainWindow):
         auto_group.setLayout(auto_layout)
         layout.addWidget(auto_group)
 
-        # Preview
         preview_group = QGroupBox("Motor Preview")
         preview_layout = QVBoxLayout()
         gear_layout = QHBoxLayout()
@@ -431,6 +485,7 @@ class MainWindow(QMainWindow):
     def create_imu_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
+
         ctrl_layout = QHBoxLayout()
         self.imu_poll_cb = QCheckBox("Enable IMU Polling")
         self.imu_poll_interval = QSpinBox()
@@ -474,11 +529,45 @@ class MainWindow(QMainWindow):
         data_group.setLayout(data_layout)
         layout.addWidget(data_group)
 
+        log_group = QGroupBox("IMU Data Log")
+        log_layout = QVBoxLayout()
+        self.imu_log_text = QPlainTextEdit()
+        self.imu_log_text.setReadOnly(True)
+        self.imu_log_text.setMaximumBlockCount(1000)
+        self.imu_log_text.setFont(QFont("Courier New", 9))
+        btn_layout = QHBoxLayout()
+        self.clear_log_btn = QPushButton("Clear Log")
+        self.save_log_btn = QPushButton("Save Log to CSV")
+        self.logging_cb = QCheckBox("Auto Log")
+        self.logging_cb.setChecked(True)
+        btn_layout.addWidget(self.logging_cb)
+        btn_layout.addWidget(self.clear_log_btn)
+        btn_layout.addWidget(self.save_log_btn)
+        log_layout.addWidget(self.imu_log_text)
+        log_layout.addLayout(btn_layout)
+        log_group.setLayout(log_layout)
+        layout.addWidget(log_group)
+
+        debug_group = QGroupBox("IMU Debug Data")
+        debug_layout = QVBoxLayout()
+        self.imu_debug_text = QPlainTextEdit()
+        self.imu_debug_text.setReadOnly(True)
+        self.imu_debug_text.setMaximumHeight(120)
+        self.imu_debug_text.setFont(QFont("Courier New", 9))
+        copy_btn = QPushButton("Copy Current IMU Data")
+        copy_btn.clicked.connect(self.copy_imu_data)
+        debug_layout.addWidget(self.imu_debug_text)
+        debug_layout.addWidget(copy_btn)
+        debug_group.setLayout(debug_layout)
+        layout.addWidget(debug_group)
+
         self.imu_poll_cb.toggled.connect(self.toggle_imu_polling)
         self.imu_poll_interval.valueChanged.connect(self.update_imu_poll_interval)
         refresh_model_btn.clicked.connect(self.scan_asset_models)
         browse_btn.clicked.connect(self.browse_model_file)
         reset_btn.clicked.connect(self.reset_to_cube)
+        self.clear_log_btn.clicked.connect(self.clear_imu_log)
+        self.save_log_btn.clicked.connect(self.save_imu_log_to_csv)
         self.scan_asset_models()
         return widget
 
@@ -534,7 +623,6 @@ class MainWindow(QMainWindow):
         self.detect_btn.setEnabled(True)
         self.status_label.setText("Connected")
 
-        # 如果预览自动刷新已勾选，启动双定时器
         if self.preview_auto_cb.isChecked():
             self.start_auto_refresh()
 
@@ -570,11 +658,9 @@ class MainWindow(QMainWindow):
         if packet.func1 != 0x1A:
             return
 
-        # 清除忙标志（自动刷新命令的响应）
         if packet.func2 in (0x30, 0x31, 0x32, 0x33) and self.auto_refresh_enabled:
             self.is_busy = False
 
-        # 处理各种命令
         if packet.func2 == 0x00 and packet.func3 == 0x00:
             self.handle_detect_response(packet)
         elif packet.func2 == 0x01:
@@ -803,7 +889,6 @@ class MainWindow(QMainWindow):
         tot, mod = compute_rotations_and_mod(actual_angle)
         self.actual_angle_label.setText(f"Actual Angle: {actual_angle:.1f}°  (Rot: {tot}, Mod: {mod:.1f}°)")
 
-    # 实时数据轮询（用于绘图标签）
     def toggle_polling(self, enabled):
         if enabled:
             if self.motor_id is None:
@@ -811,7 +896,7 @@ class MainWindow(QMainWindow):
                 self.poll_checkbox.setChecked(False)
                 return
             self.poll_enabled = True
-            self.poll_timer.start(50)   # 20Hz
+            self.poll_timer.start(50)
         else:
             self.poll_enabled = False
             self.poll_timer.stop()
@@ -944,16 +1029,14 @@ class MainWindow(QMainWindow):
         except:
             return 0
 
-    # ---------- 自动刷新（双定时器 + 忙标志）----------
     def start_auto_refresh(self):
         if not self.comm_backend or self.auto_refresh_enabled:
             return
         self.auto_refresh_enabled = True
         self.is_busy = False
         self.preview_toggle = True
-        self.preview_timer.start(50)      # 20Hz 预览，平滑
-        self.currents_timer.start(300)    # 约3.3Hz 电流
-        # 立即发送一次请求
+        self.preview_timer.start(50)
+        self.currents_timer.start(300)
         self.request_next_preview()
         self.request_currents()
 
@@ -969,16 +1052,15 @@ class MainWindow(QMainWindow):
         mid = self.get_current_motor_id()
         if mid == 0:
             return
-        # 忙标志检查 + 超时恢复
         if self.is_busy:
             if time.time() * 1000 - self.busy_start > self.busy_timeout:
                 self.is_busy = False
             else:
                 return
         if self.preview_toggle:
-            self.send_command(0x33, 0x00, motor_id=mid)   # 位置
+            self.send_command(0x33, 0x00, motor_id=mid)
         else:
-            self.send_command(0x32, 0x00, motor_id=mid)   # 速度
+            self.send_command(0x32, 0x00, motor_id=mid)
         self.preview_toggle = not self.preview_toggle
         self.is_busy = True
         self.busy_start = time.time() * 1000
@@ -990,29 +1072,24 @@ class MainWindow(QMainWindow):
         if mid == 0:
             return
         if self.is_busy:
-            return   # 等待预览完成，下次定时器再试
-        # 连续发送两个电流命令
+            return
         self.send_command(0x30, 0x00, motor_id=mid)
         self.send_command(0x31, 0x00, motor_id=mid)
         self.is_busy = True
         self.busy_start = time.time() * 1000
 
     def toggle_preview_auto_refresh(self, enabled):
-        """用户勾选/取消 'Auto Refresh Preview' 时调用"""
         if enabled and self.comm_backend and self.get_current_motor_id() != 0:
             self.start_auto_refresh()
         else:
             self.stop_auto_refresh()
 
     def on_motor_id_changed(self):
-        """电机ID改变时，重置状态"""
         if hasattr(self, 'speed_label'):
             self.speed_label.setText("Motor Speed: --- rpm")
         if self.auto_refresh_enabled:
-            # 重置忙标志，重新开始
             self.is_busy = False
 
-    # ---------- 参数自动刷新（慢速）----------
     def toggle_auto_refresh(self, enabled):
         if enabled:
             self.auto_refresh_timer = QTimer()
@@ -1035,7 +1112,7 @@ class MainWindow(QMainWindow):
         self.get_pid("Speed")
         self.get_pid("Position")
 
-    # IMU
+    # ==================== IMU 相关函数 ====================
     def request_imu_data(self):
         if not self.comm_backend or not self.imu_poll_enabled:
             return
@@ -1056,67 +1133,171 @@ class MainWindow(QMainWindow):
             v = v & 0xFFFF
             return v - 0x10000 if v & 0x8000 else v
 
-        ax = to_int16(data1>>16) * 0.000122
-        ay = to_int16(data1 & 0xFFFF) * 0.000122
-        az = to_int16(data2>>16) * 0.000122
-        gx = to_int16(data2 & 0xFFFF) * 0.035
-        gy = to_int16(data3>>16) * 0.035
-        gz = to_int16(data3 & 0xFFFF) * 0.035
-        temp = to_int16(data4>>16) * (1/256.0) + 25.0
+        ax_raw = to_int16(data1>>16)
+        ay_raw = to_int16(data1 & 0xFFFF)
+        az_raw = to_int16(data2>>16)
+        gx_raw = to_int16(data2 & 0xFFFF)
+        gy_raw = to_int16(data3>>16)
+        gz_raw = to_int16(data3 & 0xFFFF)
+        temp_raw = to_int16(data4>>16)
 
-        self.imu_data.update({'ax':ax,'ay':ay,'az':az,'gx':gx,'gy':gy,'gz':gz,'temp':temp})
+        self.ax_raw = ax_raw
+        self.ay_raw = ay_raw
+        self.az_raw = az_raw
+        self.gx_raw = gx_raw
+        self.gy_raw = gy_raw
+        self.gz_raw = gz_raw
+
+        # 量程系数：根据实际 LSM6DS3TR 配置 ±1000dps，加速度 ±4g
+        # 若板端配置不同，请修改以下系数
+        GYRO_SCALE = 0.0305   # 1000 dps / 32768
+        ACC_SCALE = 0.000122  # 4g / 32768
+
+        ax = ax_raw * ACC_SCALE
+        ay = ay_raw * ACC_SCALE
+        az = az_raw * ACC_SCALE
+        gx = gx_raw * GYRO_SCALE
+        gy = gy_raw * GYRO_SCALE
+        gz = gz_raw * GYRO_SCALE
+        temp = temp_raw / 256.0 + 25.0
+
+        # 坐标系映射（若旋转方向不对，请调整此处）
+        # 默认不映射，可根据需要取消注释
+        # ax_gui = -ay
+        # ay_gui =  az
+        # az_gui = -ax
+        # gx_gui = -gy
+        # gy_gui =  gz
+        # gz_gui = -gx
+        ax_gui = ax
+        ay_gui = ay
+        az_gui = az
+        gx_gui = gx
+        gy_gui = gy
+        gz_gui = gz
+
+        self.imu_data.update({'ax':ax, 'ay':ay, 'az':az, 'gx':gx, 'gy':gy, 'gz':gz, 'temp':temp})
         self.label_ax.setText(f"ax: {ax:.3f} g")
         self.label_ay.setText(f"ay: {ay:.3f} g")
         self.label_az.setText(f"az: {az:.3f} g")
         self.label_gx.setText(f"gx: {gx:.1f} dps")
         self.label_gy.setText(f"gy: {gy:.1f} dps")
         self.label_gz.setText(f"gz: {gz:.1f} dps")
-        self.update_orientation(gx,gy,gz,ax,ay,az)
 
-    def update_orientation(self, gx, gy, gz, ax, ay, az):
-        dt = time.time() - self.last_imu_time
-        if dt <= 0 or dt > 0.1:
+        # 自动零偏校准
+        if self.calibrating_gyro:
+            self.calib_buffer.append((gx_gui, gy_gui, gz_gui))
+            self.calib_samples += 1
+            if self.calib_samples >= self.calib_max_samples:
+                avg_x = sum(v[0] for v in self.calib_buffer) / self.calib_samples
+                avg_y = sum(v[1] for v in self.calib_buffer) / self.calib_samples
+                avg_z = sum(v[2] for v in self.calib_buffer) / self.calib_samples
+                self.gyro_bias = [avg_x, avg_y, avg_z]
+                self.calibrating_gyro = False
+                print(f"[IMU] Calibration done. Bias: {avg_x:.2f}, {avg_y:.2f}, {avg_z:.2f} dps")
+                self.status_label.setText(f"IMU ready (bias: {avg_x:.1f}, {avg_y:.1f}, {avg_z:.1f})")
+                self.filter = ComplementaryFilter(dt=0.02, alpha=0.92, max_delta_deg=5.0)
+                self.calib_buffer.clear()
+            else:
+                self.status_label.setText(f"Calibrating IMU... {self.calib_samples}/{self.calib_max_samples}")
+            return
+
+        # 减去零偏
+        gx_cal = gx_gui - self.gyro_bias[0]
+        gy_cal = gy_gui - self.gyro_bias[1]
+        gz_cal = gz_gui - self.gyro_bias[2]
+
+        current_time = time.time()
+        dt = current_time - self.last_imu_time
+        if dt <= 0.001 or dt > 0.1:
             dt = 0.02
-        self.last_imu_time = time.time()
-        if not hasattr(self, 'q'):
-            self.q = [1.0,0.0,0.0,0.0]
-        gx_r = math.radians(gx); gy_r = math.radians(gy); gz_r = math.radians(gz)
-        norm = math.sqrt(gx_r**2+gy_r**2+gz_r**2)
-        if norm > 1e-6:
-            theta = norm * dt
-            half = theta * 0.5
-            s = math.sin(half)
-            c = math.cos(half)
-            ux = gx_r/norm; uy = gy_r/norm; uz = gz_r/norm
-            q_gyro = [c, ux*s, uy*s, uz*s]
-            q_new = [
-                self.q[0]*q_gyro[0] - self.q[1]*q_gyro[1] - self.q[2]*q_gyro[2] - self.q[3]*q_gyro[3],
-                self.q[0]*q_gyro[1] + self.q[1]*q_gyro[0] + self.q[2]*q_gyro[3] - self.q[3]*q_gyro[2],
-                self.q[0]*q_gyro[2] - self.q[1]*q_gyro[3] + self.q[2]*q_gyro[0] + self.q[3]*q_gyro[1],
-                self.q[0]*q_gyro[3] + self.q[1]*q_gyro[2] - self.q[2]*q_gyro[1] + self.q[3]*q_gyro[0]
-            ]
-            self.q = [x / math.sqrt(sum(i*i for i in q_new)) for x in q_new]
-        q0,q1,q2,q3 = self.q
-        roll = math.atan2(2*(q0*q1+q2*q3), 1-2*(q1*q1+q2*q2))*180/math.pi
-        pitch = math.asin(2*(q0*q2-q3*q1))*180/math.pi
-        yaw = math.atan2(2*(q0*q3+q1*q2), 1-2*(q2*q2+q3*q3))*180/math.pi
-        self.label_roll.setText(f"Roll: {roll:.1f}°")
-        self.label_pitch.setText(f"Pitch: {pitch:.1f}°")
-        self.label_yaw.setText(f"Yaw: {yaw:.1f}°")
-        self.imu_3d_view.set_orientation(roll, pitch, yaw)
+        self.last_imu_time = current_time
+
+        if self.filter is None:
+            return
+
+        self.filter.dt = dt
+        q = self.filter.update(gx_cal, gy_cal, gz_cal, ax_gui, ay_gui, az_gui)
+
+        roll_deg = math.degrees(self.filter.roll)
+        pitch_deg = math.degrees(self.filter.pitch)
+        yaw_deg = math.degrees(self.filter.yaw)
+        self.label_roll.setText(f"Roll: {roll_deg:.1f}°")
+        self.label_pitch.setText(f"Pitch: {pitch_deg:.1f}°")
+        self.label_yaw.setText(f"Yaw: {yaw_deg:.1f}°")
+
+        self.imu_3d_view.set_orientation_quat(q)
+
+        self.update_imu_debug_text()
+
+        if self.logging_cb.isChecked():
+            self.log_imu_data(ax, ay, az, gx, gy, gz, roll_deg, pitch_deg, yaw_deg)
+
+    def update_imu_debug_text(self):
+        if not hasattr(self, 'imu_debug_text'):
+            return
+        text = (f"Timestamp: {time.strftime('%H:%M:%S')}\n"
+                f"Accel (g): ax={self.imu_data['ax']:.4f}, ay={self.imu_data['ay']:.4f}, az={self.imu_data['az']:.4f}\n"
+                f"Gyro raw (dps): {self.imu_data['gx']:.1f}, {self.imu_data['gy']:.1f}, {self.imu_data['gz']:.1f}\n"
+                f"Gyro bias (dps): {self.gyro_bias[0]:.1f}, {self.gyro_bias[1]:.1f}, {self.gyro_bias[2]:.1f}\n"
+                f"Gyro cal (dps): {self.imu_data['gx']-self.gyro_bias[0]:.1f}, {self.imu_data['gy']-self.gyro_bias[1]:.1f}, {self.imu_data['gz']-self.gyro_bias[2]:.1f}\n"
+                f"Temperature: {self.imu_data['temp']:.1f}°C\n"
+                f"Orientation (deg): roll={self.label_roll.text().split(':')[1].strip()}, "
+                f"pitch={self.label_pitch.text().split(':')[1].strip()}, "
+                f"yaw={self.label_yaw.text().split(':')[1].strip()}\n"
+                f"Raw LSBs: ax={getattr(self,'ax_raw',0)}, ay={getattr(self,'ay_raw',0)}, az={getattr(self,'az_raw',0)}, "
+                f"gx={getattr(self,'gx_raw',0)}, gy={getattr(self,'gy_raw',0)}, gz={getattr(self,'gz_raw',0)}")
+        self.imu_debug_text.setPlainText(text)
+
+    def copy_imu_data(self):
+        text = self.imu_debug_text.toPlainText()
+        if text:
+            QApplication.clipboard().setText(text)
+            self.status_label.setText("IMU data copied to clipboard")
+
+    def clear_imu_log(self):
+        self.imu_log_text.clear()
+
+    def save_imu_log_to_csv(self):
+        filename, _ = QFileDialog.getSaveFileName(self, "Save IMU Log", "", "CSV Files (*.csv)")
+        if filename:
+            try:
+                with open(filename, 'w') as f:
+                    f.write(self.imu_log_text.toPlainText())
+                QMessageBox.information(self, "Saved", f"Log saved to {filename}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", str(e))
+
+    def log_imu_data(self, ax, ay, az, gx, gy, gz, roll, pitch, yaw):
+        timestamp = time.strftime("%H:%M:%S") + f".{int(time.time()*1000)%1000:03d}"
+        log_line = (f"{timestamp}, {ax:.3f}, {ay:.3f}, {az:.3f}, "
+                    f"{gx:.1f}, {gy:.1f}, {gz:.1f}, "
+                    f"{roll:.1f}, {pitch:.1f}, {yaw:.1f}")
+        self.imu_log_text.appendPlainText(log_line)
+        scrollbar = self.imu_log_text.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
     def toggle_imu_polling(self, enabled):
         self.imu_poll_enabled = enabled
         if enabled:
+            self.calibrating_gyro = True
+            self.calib_samples = 0
+            self.calib_buffer = []
+            self.gyro_bias = [0.0, 0.0, 0.0]
+            self.filter = None
+            self.status_label.setText("IMU calibrating... Keep device still")
             self.imu_poll_timer.start(self.imu_poll_interval.value())
             self.request_imu_data()
         else:
             self.imu_poll_timer.stop()
+            self.calibrating_gyro = False
+            self.status_label.setText("IMU polling stopped")
 
     def update_imu_poll_interval(self):
         if self.imu_poll_enabled:
             self.imu_poll_timer.start(self.imu_poll_interval.value())
 
+    # ---------- 3D 模型相关 ----------
     def scan_asset_models(self):
         import glob
         self.model_combo.blockSignals(True)
@@ -1171,82 +1352,88 @@ class MainWindow(QMainWindow):
         self.manual_response_buffer.append(f"[TX] {spaced}")
 
     def load_config_list(self):
+        """Refresh the config dropdown from the config directory."""
         self.config_combo.clear()
-        if not os.path.exists(self.config_dir):
-            os.makedirs(self.config_dir)
-        files = [f for f in os.listdir(self.config_dir) if f.endswith('.json')]
-        files.sort()
+        files = self.config_manager.list_configs()
         for f in files:
             self.config_combo.addItem(f)
+        # auto-select the currently active config if it exists in the list
+        if self.config_manager.current_name != "Unsaved":
+            idx = self.config_combo.findText(self.config_manager.current_name)
+            if idx >= 0:
+                self.config_combo.setCurrentIndex(idx)
+                return
         if files:
             self.config_combo.setCurrentIndex(0)
 
+    def _update_config_status(self, success=True, message=None):
+        """Update the config status label."""
+        if message:
+            text = message
+            color = "green" if success else "red"
+        else:
+            name = self.config_manager.current_name
+            text = f"Active: {name}"
+            color = "green"
+        self.config_status_label.setText(text)
+        self.config_status_label.setStyleSheet(f"color: {color}; font-style: italic;")
+
     def on_load_config(self):
+        """Load the selected config from the dropdown and apply to GUI."""
         file = self.config_combo.currentText()
         if not file:
+            QMessageBox.warning(self, "No Config", "No config file selected.")
             return
-        path = os.path.join(self.config_dir, file)
+        path = os.path.join(self.config_manager.config_dir, file)
         try:
-            with open(path, 'r') as f:
-                cfg = json.load(f)
-            self.target_iq.setValue(cfg.get('targets',{}).get('iq',0))
-            self.target_id.setValue(cfg.get('targets',{}).get('id',0))
-            self.target_speed.setValue(cfg.get('targets',{}).get('speed',0))
-            self.target_position.setValue(cfg.get('targets',{}).get('position',0))
-            self.target_uq.setValue(cfg.get('targets',{}).get('uq',0))
-            self.target_ud.setValue(cfg.get('targets',{}).get('ud',0))
-            for name in ['Iq','Id','Speed','Position']:
-                if name in cfg.get('pid',{}):
-                    p,i,d,_,_ = self.pid_widgets[name]
-                    p.setValue(cfg['pid'][name].get('p',0))
-                    i.setValue(cfg['pid'][name].get('i',0))
-                    d.setValue(cfg['pid'][name].get('d',0))
-            limits = cfg.get('limits',{})
-            self.limit_iq_max.setValue(limits.get('iq_max',0))
-            self.limit_iq_min.setValue(limits.get('iq_min',0))
-            self.limit_id_max.setValue(limits.get('id_max',0))
-            self.limit_id_min.setValue(limits.get('id_min',0))
-            self.limit_speed_max.setValue(limits.get('speed_max',0))
-            self.limit_speed_min.setValue(limits.get('speed_min',0))
-            self.limit_position_max.setValue(limits.get('position_max',0))
-            self.limit_position_min.setValue(limits.get('position_min',0))
-            self.gear_ratio_edit.setText(cfg.get('gear_ratio','1 : 1'))
-            QMessageBox.information(self, "Config", "Loaded")
+            self.config_manager.load_and_apply(self, path)
+            self._update_config_status(True)
+            QMessageBox.information(self, "Config", f"Loaded: {file}")
         except Exception as e:
+            self._update_config_status(False, f"Failed to load: {e}")
+            QMessageBox.critical(self, "Error", str(e))
+
+    def on_import_config(self):
+        """Import a config file from anywhere on disk into the config dir,
+        then load and apply it."""
+        src, _ = QFileDialog.getOpenFileName(
+            self, "Import Config", "",
+            "JSON Files (*.json);;All Files (*)")
+        if not src:
+            return
+        try:
+            dst = self.config_manager.import_file(src)
+            self.config_manager.load_and_apply(self, dst)
+            self.load_config_list()
+            # select the newly imported file
+            imported_name = os.path.basename(dst)
+            idx = self.config_combo.findText(imported_name)
+            if idx >= 0:
+                self.config_combo.setCurrentIndex(idx)
+            self._update_config_status(True)
+            QMessageBox.information(self, "Imported",
+                                    f"Imported and loaded: {imported_name}")
+        except Exception as e:
+            self._update_config_status(False, f"Import failed: {e}")
             QMessageBox.critical(self, "Error", str(e))
 
     def on_save_config(self):
-        filename, _ = QFileDialog.getSaveFileName(self, "Save Config", self.config_dir, "JSON (*.json)")
-        if filename:
-            cfg = {
-                'targets': {
-                    'iq': self.target_iq.value(),
-                    'id': self.target_id.value(),
-                    'speed': self.target_speed.value(),
-                    'position': self.target_position.value(),
-                    'uq': self.target_uq.value(),
-                    'ud': self.target_ud.value()
-                },
-                'pid': {},
-                'limits': {
-                    'iq_max': self.limit_iq_max.value(),
-                    'iq_min': self.limit_iq_min.value(),
-                    'id_max': self.limit_id_max.value(),
-                    'id_min': self.limit_id_min.value(),
-                    'speed_max': self.limit_speed_max.value(),
-                    'speed_min': self.limit_speed_min.value(),
-                    'position_max': self.limit_position_max.value(),
-                    'position_min': self.limit_position_min.value()
-                },
-                'gear_ratio': self.gear_ratio_edit.text()
-            }
-            for name in ['Iq','Id','Speed','Position']:
-                p,i,d,_,_ = self.pid_widgets[name]
-                cfg['pid'][name] = {'p':p.value(), 'i':i.value(), 'd':d.value()}
-            try:
-                with open(filename, 'w') as f:
-                    json.dump(cfg, f, indent=4)
-                QMessageBox.information(self, "Saved", f"Saved to {filename}")
-                self.load_config_list()
-            except Exception as e:
-                QMessageBox.critical(self, "Error", str(e))
+        """Save current GUI settings as a new config file, then set it as active."""
+        default_dir = self.config_manager.config_dir
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Save Config As", default_dir, "JSON (*.json)")
+        if not filename:
+            return
+        try:
+            self.config_manager.save_current(self, filename)
+            self.load_config_list()
+            # auto-select the newly saved file
+            saved_name = os.path.basename(filename)
+            idx = self.config_combo.findText(saved_name)
+            if idx >= 0:
+                self.config_combo.setCurrentIndex(idx)
+            self._update_config_status(True)
+            QMessageBox.information(self, "Saved", f"Saved to {saved_name}")
+        except Exception as e:
+            self._update_config_status(False, f"Save failed: {e}")
+            QMessageBox.critical(self, "Error", str(e))
