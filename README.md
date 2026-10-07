@@ -32,12 +32,18 @@ Motor GUI for motor control, monitoring, tuning, and IMU visualization.
 
 ## Project Files
 
-- `motor_gui.py` — main GUI application
-- `run.bat`
-- `run.sh`
+- `main.py` — main GUI application (entry point)
+- `run.bat` — launcher for Windows
+- `run.sh` — launcher for Linux
+- `run.command` — launcher for macOS (double-click in Finder)
 
 
 ## Installation
+
+Each launcher creates a `venv`, installs the required packages
+(`PyQt5`, `pyqtgraph`, `numpy`, `pyserial`, `PyOpenGL`) plus the optional
+`python-can` / `trimesh`, and then starts the GUI. Re-running a launcher is
+fast: the existing environment is reused when all required packages are present.
 
 ### Option 1: Linux/macOS
 
@@ -45,11 +51,21 @@ Motor GUI for motor control, monitoring, tuning, and IMU visualization.
 sh ./run.sh
 ```
 
-### Option 2: Win
+On macOS you can also double-click `run.command`.
 
-```bash
-bash run.bat
+### Option 2: Windows
+
+Double-click `run.bat`, or run it from a terminal:
+
+```bat
+run.bat
 ```
+
+> Requires Python 3 on `PATH` (the `py` launcher also works). If Python is
+> missing, install it from <https://www.python.org/downloads/> with
+> **Add python.exe to PATH** enabled.
+
+> `run.bat` is a Windows batch script. Do **not** run it with `bash`.
 
 ## Main Interface
 

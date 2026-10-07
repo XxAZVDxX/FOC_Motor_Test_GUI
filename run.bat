@@ -1,105 +1,108 @@
-#!/bin/bash
+@echo off
+setlocal enabledelayedexpansion
+cd /d "%~dp0"
 
-# Motor GUI Smart Launcher for Linux/macOS
+REM Motor GUI Smart Launcher for Windows
 
-set -e
+set "VENV_DIR=venv"
+set "VENV_PY=%VENV_DIR%\Scripts\python.exe"
+set "REQUIRED_PKGS=PyQt5 pyqtgraph numpy pyserial PyOpenGL"
+set "OPTIONAL_PKGS=python-can trimesh"
+REM "package:import" pairs used to verify the venv is usable
+set "CHECK_LIST=PyQt5:PyQt5 pyqtgraph:pyqtgraph numpy:numpy pyserial:serial PyOpenGL:OpenGL"
 
-VENV_DIR="venv"
-REQUIRED_PKGS="PyQt5 pyqtgraph numpy pyserial PyOpenGL"
-OPTIONAL_PKGS="python-can trimesh"
+echo ========================================
+echo   Motor GUI - Smart Launcher (Windows)
+echo ========================================
+echo.
 
-echo "========================================"
-echo "  Motor GUI - Smart Launcher (Unix)"
-echo "========================================"
-echo
+set "PYTHON="
+where py >nul 2>&1 && set "PYTHON=py"
+if not defined PYTHON (
+    where python >nul 2>&1 && set "PYTHON=python"
+)
+if not defined PYTHON (
+    echo [ERROR] Python 3 was not found in PATH.
+    echo         Install it from https://www.python.org/downloads/ and make sure
+    echo         "Add python.exe to PATH" is checked, then run this file again.
+    echo.
+    pause
+    exit /b 1
+)
+echo Using Python launcher: %PYTHON%
+echo.
 
-# 检查 Python
-if ! command -v python3 &> /dev/null; then
-    echo "[ERROR] Python3 is not installed or not in PATH."
-    exit 1
-fi
+set "NEED_SETUP=0"
 
-NEED_SETUP=0
+if exist "%VENV_PY%" (
+    echo Virtual environment found. Checking required packages...
+    set "MISSING=0"
+    for %%E in (%CHECK_LIST%) do (
+        for /f "tokens=1,2 delims=:" %%A in ("%%E") do (
+            "%VENV_PY%" -c "import %%B" >nul 2>&1
+            if errorlevel 1 (
+                echo   - Missing: %%A
+                set "MISSING=1"
+            )
+        )
+    )
+    if "!MISSING!"=="1" (
+        echo [INFO] Some required packages are missing. Rebuilding the environment...
+        set "NEED_SETUP=1"
+    ) else (
+        echo All required packages are present.
+    )
+) else (
+    echo Virtual environment not found.
+    set "NEED_SETUP=1"
+)
 
-# 检查虚拟环境
-if [ -d "$VENV_DIR/bin" ]; then
-    echo "Virtual environment found. Activating..."
-    source "$VENV_DIR/bin/activate"
-    if [ $? -ne 0 ]; then
-        echo "[WARN] Failed to activate venv. Will recreate."
-        NEED_SETUP=1
-    else
-        # 检查必需库
-        echo "Checking required packages..."
-        MISSING=0
-        for pkg in $REQUIRED_PKGS; do
-            python3 -c "import $pkg" 2>/dev/null
-            if [ $? -ne 0 ]; then
-                echo "  - Missing: $pkg"
-                MISSING=1
-            fi
-        done
-        if [ $MISSING -eq 1 ]; then
-            echo "[INFO] Some required packages are missing. Installing..."
-            NEED_SETUP=1
-        else
-            echo "All required packages are present."
-            NEED_SETUP=0
-        fi
-    fi
-else
-    echo "Virtual environment not found."
-    NEED_SETUP=1
-fi
+if "!NEED_SETUP!"=="1" (
+    echo.
+    echo Setting up environment...
 
-# 设置环境
-if [ $NEED_SETUP -eq 1 ]; then
-    echo
-    echo "Setting up environment..."
+    if exist "%VENV_DIR%" (
+        echo Removing old venv...
+        rmdir /s /q "%VENV_DIR%"
+    )
 
-    # 删除旧 venv（如果存在）
-    if [ -d "$VENV_DIR" ]; then
-        echo "Removing old venv..."
-        rm -rf "$VENV_DIR"
-    fi
+    echo Creating new venv...
+    %PYTHON% -m venv "%VENV_DIR%"
+    if errorlevel 1 (
+        echo [ERROR] Failed to create venv.
+        echo.
+        pause
+        exit /b 1
+    )
 
-    echo "Creating new venv..."
-    python3 -m venv "$VENV_DIR"
-    if [ $? -ne 0 ]; then
-        echo "[ERROR] Failed to create venv."
-        exit 1
-    fi
+    echo Upgrading pip...
+    "%VENV_PY%" -m pip install --upgrade pip
 
-    echo "Activating venv..."
-    source "$VENV_DIR/bin/activate"
-    if [ $? -ne 0 ]; then
-        echo "[ERROR] Failed to activate venv."
-        exit 1
-    fi
+    echo Installing required packages...
+    "%VENV_PY%" -m pip install %REQUIRED_PKGS%
+    if errorlevel 1 (
+        echo [ERROR] Failed to install required packages.
+        echo.
+        pause
+        exit /b 1
+    )
 
-    echo "Upgrading pip..."
-    pip install --upgrade pip
+    echo Installing optional packages ^(CAN, 3D models^)...
+    "%VENV_PY%" -m pip install %OPTIONAL_PKGS%
+    if errorlevel 1 (
+        echo [INFO] Optional packages not installed ^(CAN/3D features disabled^).
+    )
+    echo.
+)
 
-    echo "Installing required packages..."
-    pip install $REQUIRED_PKGS PyOpenGL_accelerate
-    if [ $? -ne 0 ]; then
-        echo "[WARN] PyOpenGL_accelerate failed, installing PyOpenGL only..."
-        pip install PyOpenGL
-    fi
+echo Starting Motor GUI...
+"%VENV_PY%" main.py
+if errorlevel 1 (
+    echo.
+    echo [ERROR] Motor GUI exited with an error. See the messages above.
+    echo.
+    pause
+    exit /b 1
+)
 
-    echo "Installing optional packages (CAN, 3D models)..."
-    pip install $OPTIONAL_PKGS 2>/dev/null
-    if [ $? -ne 0 ]; then
-        echo "[INFO] Optional packages not installed (CAN/3D features disabled)."
-    fi
-    echo
-fi
-
-# 确保虚拟环境已激活
-if [ -z "$VIRTUAL_ENV" ]; then
-    source "$VENV_DIR/bin/activate"
-fi
-
-# 运行主程序
-echo "Starting Motor GUI..."
-python3 motor_gui.py
+endlocal
