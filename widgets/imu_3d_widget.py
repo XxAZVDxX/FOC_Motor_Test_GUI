@@ -21,7 +21,8 @@ class IMU3DWidget(GLViewWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setBackgroundColor('k')
-        self.setCameraPosition(distance=3)
+        # 相机拉近一些，让默认立方体在放大的视口中占更大比例
+        self.setCameraPosition(distance=2.5)
         grid = GLGridItem()
         grid.scale(1, 1, 1)
         self.addItem(grid)

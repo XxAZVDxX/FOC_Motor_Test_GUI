@@ -13,7 +13,8 @@ from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTabWidget,
                              QFormLayout, QComboBox, QHBoxLayout, QLineEdit,
                              QPushButton, QDoubleSpinBox, QCheckBox, QSpinBox,
                              QGroupBox, QPlainTextEdit, QAction, QActionGroup,
-                             QScrollArea, QFrame)
+                             QScrollArea, QFrame, QGridLayout, QSplitter,
+                             QListWidget)
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QFont
 
@@ -47,10 +48,15 @@ INTERFACE_ITEMS = [
 
 DEFAULT_CUBE = "Default Cube"
 
+# 串口列表自动刷新间隔（毫秒）与电机 ID 检测超时（毫秒）
+PORT_REFRESH_INTERVAL_MS = 1500
+DETECT_TIMEOUT_MS = 3000
+
 TAB_KEYS = ["Connection", "Motor Control", "PID Tuning", "Real-time Data",
             "Limits", "Manual", "IMU 3D"]
 
 # 各类轮询各自归属的标签页，只有该页可见时才允许请求数据
+TAB_CONNECTION = TAB_KEYS.index("Connection")
 TAB_MOTOR_CONTROL = TAB_KEYS.index("Motor Control")
 TAB_REALTIME_DATA = TAB_KEYS.index("Real-time Data")
 TAB_IMU = TAB_KEYS.index("IMU 3D")
@@ -154,6 +160,19 @@ class MainWindow(QMainWindow):
         self.auto_refresh_timer_running = False
         self.auto_refresh_interval_ms = 1000
 
+        # 串口列表自动刷新：只在连接页可见且未连接时运行
+        self.port_refresh_timer = QTimer()
+        self.port_refresh_timer.timeout.connect(self.refresh_serial_ports)
+        self.port_refresh_timer.setInterval(PORT_REFRESH_INTERVAL_MS)
+
+        # 电机 ID 检测看门狗：广播后若超时仍无应答则提示用户
+        self.detect_pending = False
+        self.detect_auto = False
+        self.detect_timeout_timer = QTimer()
+        self.detect_timeout_timer.setSingleShot(True)
+        self.detect_timeout_timer.setInterval(DETECT_TIMEOUT_MS)
+        self.detect_timeout_timer.timeout.connect(self.on_detect_timeout)
+
         self.gear_ratio_num = 1.0
         self.gear_ratio_den = 1.0
         self.last_position_deg = 0.0
@@ -211,7 +230,8 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         main_layout.addWidget(self.tabs)
 
-        # 内容过高的标签页放入滚动区域，避免小屏幕上控件不可达
+        # 内容过高的标签页放入滚动区域，避免小屏幕上控件不可达。
+        # force=True 用于高度依赖运行时字体度量、无法在布局前判断的标签页。
         tab_factories = [
             (self.create_connection_tab, False),
             (self.create_control_tab, True),
@@ -226,11 +246,15 @@ class MainWindow(QMainWindow):
 
         # 切页时重新评估门控，只让当前标签页继续请求数据
         self.tabs.currentChanged.connect(self.on_tab_changed)
+        # 启动时先刷新一次串口列表，让用户一打开就能看到端口
+        self.refresh_serial_ports()
 
         self.status_label = QLabel(tr("Not connected"))
         self.statusBar().addWidget(self.status_label)
 
         self.apply_theme(self.current_theme)
+        # 首次评估轮询门控：连接页的串口列表自动刷新也随之启动
+        self._apply_polling_gates()
 
     # ---------- 菜单栏 ----------
     def _wrap_scrollable(self, widget, force=False):
@@ -387,6 +411,9 @@ class MainWindow(QMainWindow):
         self.plot_widget.setLabel('left', tr("Value"))
         self.plot_widget.setLabel('bottom', tr("Time (samples)"))
         self.refresh_interval_spin.setSuffix(tr(" ms"))
+        # 详情页签的标题不参与 _text_bindings，需要单独刷新
+        self.imu_detail_tabs.setTabText(0, tr("IMU Debug Data"))
+        self.imu_detail_tabs.setTabText(1, tr("IMU Data Log"))
         # 带 itemData 的下拉框：显示文本需要单独刷新
         if self.motor_id_combo.count():
             self.motor_id_combo.setItemText(0, tr("None"))
@@ -403,7 +430,13 @@ class MainWindow(QMainWindow):
 
         self.interface_combo = QComboBox()
         self._fill_combo(self.interface_combo, INTERFACE_ITEMS, keep=False)
-        self.serial_port_combo = QComboBox()
+        # 串口用列表而不是下拉框：新出现的端口插入到列表顶部，方便一眼看到
+        self.serial_port_list = QListWidget()
+        self.serial_port_list.setMinimumHeight(96)
+        self.serial_port_list.setMaximumHeight(140)
+        self.serial_port_list.setSelectionMode(QListWidget.SingleSelection)
+        self.auto_refresh_ports_cb = self._bind_text(QCheckBox(), "Auto-refresh ports")
+        self.auto_refresh_ports_cb.setChecked(True)
         self.refresh_ports_btn = self._bind_text(QPushButton(), "Refresh")
         self.baudrate_combo = QComboBox()
         self.baudrate_combo.addItems(["9600","19200","38400","57600","115200","2000000"])
@@ -417,9 +450,18 @@ class MainWindow(QMainWindow):
         self.motor_id_label = self._label("None")
 
         layout.addRow(self._label("Interface:"), self.interface_combo)
-        port_layout = QHBoxLayout()
-        port_layout.addWidget(self.serial_port_combo)
-        port_layout.addWidget(self.refresh_ports_btn)
+        port_layout = QVBoxLayout()
+        port_layout.setSpacing(4)
+        port_row = QHBoxLayout()
+        port_row.setSpacing(6)
+        port_row.addWidget(self.serial_port_list, 1)
+        port_btns = QVBoxLayout()
+        port_btns.setSpacing(4)
+        port_btns.addWidget(self.refresh_ports_btn)
+        port_btns.addWidget(self.auto_refresh_ports_cb)
+        port_btns.addStretch(1)
+        port_row.addLayout(port_btns)
+        port_layout.addLayout(port_row)
         layout.addRow(self._label("Serial Port:"), port_layout)
         layout.addRow(self._label("Baudrate:"), self.baudrate_combo)
         layout.addRow(self._label("CAN Channel:"), self.can_channel_edit)
@@ -431,8 +473,11 @@ class MainWindow(QMainWindow):
 
         self.interface_combo.currentIndexChanged.connect(self.update_interface_visibility)
         self.refresh_ports_btn.clicked.connect(self.refresh_serial_ports)
+        self.auto_refresh_ports_cb.toggled.connect(self._on_auto_refresh_ports_toggled)
         self.connect_btn.clicked.connect(self.toggle_connection)
-        self.detect_btn.clicked.connect(self.detect_motor_id)
+        # 手动检测需要弹窗确认，用 lambda 固定 auto=False，避免误收 clicked 的 bool
+        self.detect_btn.clicked.connect(lambda _checked=False: self.detect_motor_id(auto=False))
+        self.refresh_serial_ports()
         self.update_interface_visibility()
         return widget
 
@@ -441,6 +486,11 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
+
+        # 八个分组框改用两列网格，避免纵向堆叠浪费屏幕高度
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
 
         config_group = QGroupBox(tr("Configuration"))
         self._text_bindings.append((config_group, "Configuration", "setTitle"))
@@ -471,7 +521,7 @@ class MainWindow(QMainWindow):
         cfg_vlayout.addLayout(cfg_row2)
 
         config_group.setLayout(cfg_vlayout)
-        layout.addWidget(config_group)
+        grid.addWidget(config_group, 0, 0, 1, 2)
 
         self.load_config_list()
         self.refresh_config_btn.clicked.connect(self.load_config_list)
@@ -488,7 +538,7 @@ class MainWindow(QMainWindow):
         id_layout.addWidget(self._label("Motor ID:"))
         id_layout.addWidget(self.motor_id_combo)
         id_group.setLayout(id_layout)
-        layout.addWidget(id_group)
+        grid.addWidget(id_group, 1, 1)
         self.motor_id_combo.currentIndexChanged.connect(self.on_motor_id_changed)
 
         mode_group = QGroupBox(tr("Operating Mode"))
@@ -506,7 +556,7 @@ class MainWindow(QMainWindow):
         btn_layout.addWidget(self.get_mode_btn)
         mode_layout.addRow(btn_layout)
         mode_group.setLayout(mode_layout)
-        layout.addWidget(mode_group)
+        grid.addWidget(mode_group, 1, 0)
 
         param_group = QGroupBox(tr("Motor Parameters"))
         self._text_bindings.append((param_group, "Motor Parameters", "setTitle"))
@@ -521,13 +571,14 @@ class MainWindow(QMainWindow):
         param_layout.addRow(self._label("Encoder Direction:"), self.encoder_dir_label)
         param_layout.addRow(get_params_btn)
         param_group.setLayout(param_layout)
-        layout.addWidget(param_group)
+        grid.addWidget(param_group, 2, 0)
         get_params_btn.clicked.connect(self.get_motor_parameters)
 
         target_group = QGroupBox(tr("Target Values"))
         self._text_bindings.append((target_group, "Target Values", "setTitle"))
-        target_layout = QFormLayout()
-        target_layout.setSpacing(6)
+        target_layout = QGridLayout()
+        target_layout.setHorizontalSpacing(8)
+        target_layout.setVerticalSpacing(4)
         self.target_iq = QDoubleSpinBox(); self.target_iq.setRange(-10,10); self.target_iq.setDecimals(3)
         self.target_id = QDoubleSpinBox(); self.target_id.setRange(-10,10); self.target_id.setDecimals(3)
         self.target_speed = QDoubleSpinBox(); self.target_speed.setRange(-5000,5000)
@@ -537,20 +588,23 @@ class MainWindow(QMainWindow):
         set_target_btn = self._bind_text(QPushButton(), "Set All")
         get_target_btn = self._bind_text(QPushButton(), "Get All")
         self.get_speed_btn = self._bind_text(QPushButton(), "Get Speed")
-        target_layout.addRow(self._label("Iq:"), self.target_iq)
-        target_layout.addRow(self._label("Id:"), self.target_id)
-        target_layout.addRow(self._label("Speed (rpm):"), self.target_speed)
-        target_layout.addRow(self._label("Position (deg):"), self.target_position)
-        target_layout.addRow(self._label("Uq:"), self.target_uq)
-        target_layout.addRow(self._label("Ud:"), self.target_ud)
+        # (label key, widget) 成对排列成两列，把 6 行压缩为 3 行
+        targets = (("Iq:", self.target_iq), ("Id:", self.target_id),
+                   ("Speed (rpm):", self.target_speed),
+                   ("Position (deg):", self.target_position),
+                   ("Uq:", self.target_uq), ("Ud:", self.target_ud))
+        for idx, (key, spin) in enumerate(targets):
+            row, col = divmod(idx, 2)
+            target_layout.addWidget(self._label(key), row, col * 2)
+            target_layout.addWidget(spin, row, col * 2 + 1)
         btn_hlay = QHBoxLayout()
         btn_hlay.setSpacing(6)
         btn_hlay.addWidget(set_target_btn)
         btn_hlay.addWidget(get_target_btn)
         btn_hlay.addWidget(self.get_speed_btn)
-        target_layout.addRow(btn_hlay)
+        target_layout.addLayout(btn_hlay, 3, 0, 1, 4)
         target_group.setLayout(target_layout)
-        layout.addWidget(target_group)
+        grid.addWidget(target_group, 2, 1)
         set_target_btn.clicked.connect(self.set_targets)
         get_target_btn.clicked.connect(self.get_targets)
         self.get_speed_btn.clicked.connect(self.get_motor_speed)
@@ -566,7 +620,7 @@ class MainWindow(QMainWindow):
         curr_layout.addRow(self._label("Ib:"), self.label_Ib)
         curr_layout.addRow(self._label("Ic:"), self.label_Ic)
         current_group.setLayout(curr_layout)
-        layout.addWidget(current_group)
+        grid.addWidget(current_group, 3, 0)
 
         auto_group = QGroupBox(tr("Auto Refresh"))
         self._text_bindings.append((auto_group, "Auto Refresh", "setTitle"))
@@ -590,10 +644,11 @@ class MainWindow(QMainWindow):
         self.preview_auto_cb.toggled.connect(self.toggle_preview_auto_refresh)
         auto_layout.addWidget(self.preview_auto_cb)
         auto_group.setLayout(auto_layout)
-        layout.addWidget(auto_group)
+        grid.addWidget(auto_group, 3, 1)
 
         preview_group = QGroupBox(tr("Motor Preview"))
         self._text_bindings.append((preview_group, "Motor Preview", "setTitle"))
+        # 表盘居中放大，读数在下方并排成两列
         preview_layout = QVBoxLayout()
         preview_layout.setSpacing(6)
         gear_layout = QHBoxLayout()
@@ -604,30 +659,37 @@ class MainWindow(QMainWindow):
         gear_layout.addWidget(self.gear_ratio_edit)
         preview_layout.addLayout(gear_layout)
 
-        dial_layout = QHBoxLayout()
-        dial_layout.setSpacing(6)
         self.motor_preview = MotorPreviewWidget()
-        dial_layout.addWidget(self.motor_preview, 1)
-        info_layout = QVBoxLayout()
-        info_layout.setSpacing(4)
+        preview_layout.addWidget(self.motor_preview, 0, Qt.AlignHCenter)
+
+        # 读数排成两列放在表盘下方，不再用竖排长文本撑宽整个标签页
+        info_layout = QGridLayout()
+        info_layout.setHorizontalSpacing(10)
+        info_layout.setVerticalSpacing(2)
         self.actual_angle_label = self._label("Actual Angle: --- °")
         self.raw_angle_label = self._label("Raw Motor Angle: --- °")
         self.total_rotations_label = self._label("Total rotations: ---")
         self.mod_angle_label = self._label("Mod angle (0-360°): ---")
         self.speed_label = self._label("Motor Speed: --- rpm")
         self.speed_label.setFont(QFont("Arial", 10))
+        info_layout.addWidget(self.actual_angle_label, 0, 0)
+        info_layout.addWidget(self.raw_angle_label, 0, 1)
+        info_layout.addWidget(self.total_rotations_label, 1, 0)
+        info_layout.addWidget(self.mod_angle_label, 1, 1)
+        info_layout.addWidget(self.speed_label, 2, 0)
 
-        info_layout.addWidget(self.actual_angle_label)
-        info_layout.addWidget(self.raw_angle_label)
-        info_layout.addWidget(self.total_rotations_label)
-        info_layout.addWidget(self.mod_angle_label)
-        info_layout.addWidget(self.speed_label)
-        info_layout.addStretch()
-        dial_layout.addLayout(info_layout, 0)
-
-        preview_layout.addLayout(dial_layout)
+        preview_layout.addLayout(info_layout)
+        preview_layout.addStretch(1)
         preview_group.setLayout(preview_layout)
-        layout.addWidget(preview_group)
+        grid.addWidget(preview_group, 4, 0, 1, 2)
+
+        # 显示区比输入区更值得占用多余宽度，行 2/3 也允许拉伸
+        grid.setColumnStretch(0, 3)
+        grid.setColumnStretch(1, 2)
+        grid.setRowStretch(2, 1)
+        grid.setRowStretch(3, 1)
+        grid.setRowStretch(4, 2)
+        layout.addLayout(grid)
 
         self.set_mode_btn.clicked.connect(self.set_motor_mode)
         self.get_mode_btn.clicked.connect(self.get_motor_mode)
@@ -639,7 +701,11 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
         self.pid_widgets = {}
-        for name in ['Iq','Id','Speed','Position']:
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+        # 四个 PID 分组排列成 2×2，而不是纵向堆叠
+        for idx, name in enumerate(['Iq','Id','Speed','Position']):
             group = QGroupBox(tr("{} PID").format(name))
             form = QFormLayout()
             form.setSpacing(6)
@@ -657,10 +723,13 @@ class MainWindow(QMainWindow):
             form.addRow(self._label("D:"), d)
             form.addRow(btn_layout)
             group.setLayout(form)
-            layout.addWidget(group)
+            row, col = divmod(idx, 2)
+            grid.addWidget(group, row, col)
             self.pid_widgets[name] = (p,i,d,set_btn,get_btn)
             set_btn.clicked.connect(lambda ch, n=name: self.set_pid(n))
             get_btn.clicked.connect(lambda ch, n=name: self.get_pid(n))
+        layout.addLayout(grid)
+        layout.addStretch(1)
         return widget
 
     def create_data_tab(self):
@@ -696,9 +765,10 @@ class MainWindow(QMainWindow):
 
     def create_limits_tab(self):
         widget = QWidget()
-        layout = QFormLayout(widget)
+        layout = QGridLayout(widget)
         layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(4)
         self.limit_iq_max = QDoubleSpinBox(); self.limit_iq_max.setRange(-100,100)
         self.limit_iq_min = QDoubleSpinBox(); self.limit_iq_min.setRange(-100,100)
         self.limit_id_max = QDoubleSpinBox(); self.limit_id_max.setRange(-100,100)
@@ -707,17 +777,28 @@ class MainWindow(QMainWindow):
         self.limit_speed_min = QDoubleSpinBox(); self.limit_speed_min.setRange(-10000,10000)
         self.limit_position_max = QDoubleSpinBox(); self.limit_position_max.setRange(-10000,10000)
         self.limit_position_min = QDoubleSpinBox(); self.limit_position_min.setRange(-10000,10000)
-        layout.addRow(self._label("Iq max:"), self.limit_iq_max)
-        layout.addRow(self._label("Iq min:"), self.limit_iq_min)
-        layout.addRow(self._label("Id max:"), self.limit_id_max)
-        layout.addRow(self._label("Id min:"), self.limit_id_min)
-        layout.addRow(self._label("Speed max:"), self.limit_speed_max)
-        layout.addRow(self._label("Speed min:"), self.limit_speed_min)
-        layout.addRow(self._label("Position max:"), self.limit_position_max)
-        layout.addRow(self._label("Position min:"), self.limit_position_min)
+        # 上限/下限并排放置，8 行压缩为 4 行
+        limit_rows = (
+            ("Iq max:", self.limit_iq_max, "Iq min:", self.limit_iq_min),
+            ("Id max:", self.limit_id_max, "Id min:", self.limit_id_min),
+            ("Speed max:", self.limit_speed_max, "Speed min:", self.limit_speed_min),
+            ("Position max:", self.limit_position_max,
+             "Position min:", self.limit_position_min),
+        )
+        for row, (max_key, max_spin, min_key, min_spin) in enumerate(limit_rows):
+            layout.addWidget(self._label(max_key), row, 0)
+            layout.addWidget(max_spin, row, 1)
+            layout.addWidget(self._label(min_key), row, 2)
+            layout.addWidget(min_spin, row, 3)
         set_btn = self._bind_text(QPushButton(), "Set Limits")
         get_btn = self._bind_text(QPushButton(), "Get Limits")
-        layout.addRow(set_btn, get_btn)
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(6)
+        btn_layout.addWidget(set_btn)
+        btn_layout.addWidget(get_btn)
+        btn_layout.addStretch(1)
+        layout.addLayout(btn_layout, 4, 0, 1, 4)
+        layout.setRowStretch(5, 1)
         set_btn.clicked.connect(self.set_limits)
         get_btn.clicked.connect(self.get_limits)
         return widget
@@ -732,12 +813,10 @@ class MainWindow(QMainWindow):
         cmd_layout = QVBoxLayout()
         cmd_layout.setSpacing(6)
         self.manual_cmd_edit = QPlainTextEdit()
-        self.manual_cmd_edit.setMaximumHeight(100)
         send_btn = self._bind_text(QPushButton(), "Send")
         cmd_layout.addWidget(self.manual_cmd_edit)
         cmd_layout.addWidget(send_btn)
         cmd_group.setLayout(cmd_layout)
-        layout.addWidget(cmd_group)
 
         resp_group = QGroupBox(tr("Response (Raw Hex)"))
         self._text_bindings.append((resp_group, "Response (Raw Hex)", "setTitle"))
@@ -749,7 +828,16 @@ class MainWindow(QMainWindow):
         resp_layout.addWidget(self.manual_response_text)
         resp_layout.addWidget(clear_btn)
         resp_group.setLayout(resp_layout)
-        layout.addWidget(resp_group)
+
+        # 两个输入框改为可拖动分栏，响应区能随窗口一起变高
+        self.manual_splitter = QSplitter(Qt.Vertical)
+        self.manual_splitter.addWidget(cmd_group)
+        self.manual_splitter.addWidget(resp_group)
+        self.manual_splitter.setChildrenCollapsible(False)
+        self.manual_splitter.setStretchFactor(0, 1)
+        self.manual_splitter.setStretchFactor(1, 2)
+        self.manual_splitter.setSizes([220, 440])
+        layout.addWidget(self.manual_splitter)
 
         send_btn.clicked.connect(self.send_manual_command)
         clear_btn.clicked.connect(lambda: self.manual_response_text.clear())
@@ -761,94 +849,128 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        ctrl_layout = QHBoxLayout()
-        ctrl_layout.setSpacing(6)
+        # ── 顶部控制条：轮询开关一行，3D 模型选择一行。
+        # 拆成两行是为了压住最小宽度——八个控件挤在一行需要 1363px，
+        # 会把整个窗口撑到 1399px 宽。
+        poll_bar = QHBoxLayout()
+        poll_bar.setSpacing(6)
         self.imu_poll_cb = QCheckBox(tr("Enable IMU Polling"))
         self._text_bindings.append((self.imu_poll_cb, "Enable IMU Polling", "setText"))
         self.imu_poll_interval = QSpinBox()
-        self.imu_poll_interval.setRange(10,500)
+        self.imu_poll_interval.setRange(10, 500)
         self.imu_poll_interval.setValue(50)
-        ctrl_layout.addWidget(self.imu_poll_cb)
-        ctrl_layout.addWidget(self._label("Interval (ms):"))
-        ctrl_layout.addWidget(self.imu_poll_interval)
-        layout.addLayout(ctrl_layout)
+        poll_bar.addWidget(self.imu_poll_cb)
+        poll_bar.addWidget(self._label("Interval (ms):"))
+        poll_bar.addWidget(self.imu_poll_interval)
+        poll_bar.addStretch(1)
+        layout.addLayout(poll_bar)
 
-        self.imu_3d_view = IMU3DWidget()
-        layout.addWidget(self.imu_3d_view, stretch=2)
-
-        model_layout = QHBoxLayout()
-        model_layout.setSpacing(6)
+        model_bar = QHBoxLayout()
+        model_bar.setSpacing(6)
         self.model_combo = QComboBox()
         self.model_combo.addItem(tr(DEFAULT_CUBE), DEFAULT_CUBE)
         refresh_model_btn = self._bind_text(QPushButton(), "Refresh")
         browse_btn = self._bind_text(QPushButton(), "Browse")
         reset_btn = self._bind_text(QPushButton(), "Reset")
-        model_layout.addWidget(self._label("3D Model:"))
-        model_layout.addWidget(self.model_combo)
-        model_layout.addWidget(refresh_model_btn)
-        model_layout.addWidget(browse_btn)
-        model_layout.addWidget(reset_btn)
-        layout.addLayout(model_layout)
+        model_bar.addWidget(self._label("3D Model:"))
+        self.model_combo.setMinimumWidth(160)
+        model_bar.addWidget(self.model_combo, stretch=1)
+        model_bar.addWidget(refresh_model_btn)
+        model_bar.addWidget(browse_btn)
+        model_bar.addWidget(reset_btn)
+        layout.addLayout(model_bar)
+
+        # ── 主体：3D 视图在左，读数/日志在右侧可拖动分栏
+        self.imu_3d_view = IMU3DWidget()
+        self.imu_3d_view.setMinimumSize(360, 320)
+
+        side = QWidget()
+        side_layout = QVBoxLayout(side)
+        side_layout.setContentsMargins(0, 0, 0, 0)
+        side_layout.setSpacing(6)
 
         data_group = QGroupBox(tr("IMU Data"))
         self._text_bindings.append((data_group, "IMU Data", "setTitle"))
-        data_layout = QHBoxLayout()
-        data_layout.setSpacing(8)
-        left = QVBoxLayout(); left.addWidget(self._label("Acc (g):"))
+        data_layout = QGridLayout()
+        data_layout.setHorizontalSpacing(10)
+        data_layout.setVerticalSpacing(2)
         self.label_ax = QLabel("ax: ---")
         self.label_ay = QLabel("ay: ---")
         self.label_az = QLabel("az: ---")
-        left.addWidget(self.label_ax); left.addWidget(self.label_ay); left.addWidget(self.label_az)
-        mid = QVBoxLayout(); mid.addWidget(self._label("Gyro (dps):"))
-        self.label_gx = QLabel("gx: ---"); self.label_gy = QLabel("gy: ---"); self.label_gz = QLabel("gz: ---")
-        mid.addWidget(self.label_gx); mid.addWidget(self.label_gy); mid.addWidget(self.label_gz)
-        right = QVBoxLayout(); right.addWidget(self._label("Orientation (°):"))
-        self.label_roll = QLabel(tr("Roll: ---")); self.label_pitch = QLabel(tr("Pitch: ---")); self.label_yaw = QLabel(tr("Yaw: ---"))
+        self.label_gx = QLabel("gx: ---")
+        self.label_gy = QLabel("gy: ---")
+        self.label_gz = QLabel("gz: ---")
+        self.label_roll = QLabel(tr("Roll: ---"))
+        self.label_pitch = QLabel(tr("Pitch: ---"))
+        self.label_yaw = QLabel(tr("Yaw: ---"))
         self._text_bindings.append((self.label_roll, "Roll: ---", "setText"))
         self._text_bindings.append((self.label_pitch, "Pitch: ---", "setText"))
         self._text_bindings.append((self.label_yaw, "Yaw: ---", "setText"))
-        right.addWidget(self.label_roll); right.addWidget(self.label_pitch); right.addWidget(self.label_yaw)
-        data_layout.addLayout(left); data_layout.addLayout(mid); data_layout.addLayout(right)
+
+        data_layout.addWidget(self._label("Acc (g):"), 0, 0)
+        data_layout.addWidget(self._label("Gyro (dps):"), 0, 1)
+        data_layout.addWidget(self._label("Orientation (°):"), 0, 2)
+        for row, labels in enumerate(
+                ((self.label_ax, self.label_gx, self.label_roll),
+                 (self.label_ay, self.label_gy, self.label_pitch),
+                 (self.label_az, self.label_gz, self.label_yaw)), start=1):
+            for col, label in enumerate(labels):
+                data_layout.addWidget(label, row, col)
+        data_layout.setColumnStretch(3, 1)
         data_group.setLayout(data_layout)
-        layout.addWidget(data_group)
+        side_layout.addWidget(data_group)
 
-        log_group = QGroupBox(tr("IMU Data Log"))
-        self._text_bindings.append((log_group, "IMU Data Log", "setTitle"))
-        log_layout = QVBoxLayout()
-        log_layout.setSpacing(6)
-        self.imu_log_text = QPlainTextEdit()
-        self.imu_log_text.setReadOnly(True)
-        self.imu_log_text.setMaximumBlockCount(1000)
-        self.imu_log_text.setFont(QFont("Courier New", 9))
-        btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(6)
-        self.clear_log_btn = self._bind_text(QPushButton(), "Clear Log")
-        self.save_log_btn = self._bind_text(QPushButton(), "Save Log to CSV")
-        self.logging_cb = QCheckBox(tr("Auto Log"))
-        self._text_bindings.append((self.logging_cb, "Auto Log", "setText"))
-        self.logging_cb.setChecked(True)
-        btn_layout.addWidget(self.logging_cb)
-        btn_layout.addWidget(self.clear_log_btn)
-        btn_layout.addWidget(self.save_log_btn)
-        log_layout.addWidget(self.imu_log_text)
-        log_layout.addLayout(btn_layout)
-        log_group.setLayout(log_layout)
-        layout.addWidget(log_group)
+        # 调试信息与数据记录共用一组页签，避免两块文本框各占一半高度
+        detail_tabs = QTabWidget()
+        detail_tabs.setDocumentMode(True)
 
-        debug_group = QGroupBox(tr("IMU Debug Data"))
-        self._text_bindings.append((debug_group, "IMU Debug Data", "setTitle"))
-        debug_layout = QVBoxLayout()
+        debug_page = QWidget()
+        debug_layout = QVBoxLayout(debug_page)
+        debug_layout.setContentsMargins(6, 6, 6, 6)
         debug_layout.setSpacing(6)
         self.imu_debug_text = QPlainTextEdit()
         self.imu_debug_text.setReadOnly(True)
-        self.imu_debug_text.setMaximumHeight(120)
         self.imu_debug_text.setFont(QFont("Courier New", 9))
         copy_btn = self._bind_text(QPushButton(), "Copy Current IMU Data")
         copy_btn.clicked.connect(self.copy_imu_data)
         debug_layout.addWidget(self.imu_debug_text)
         debug_layout.addWidget(copy_btn)
-        debug_group.setLayout(debug_layout)
-        layout.addWidget(debug_group)
+        detail_tabs.addTab(debug_page, tr("IMU Debug Data"))
+
+        log_page = QWidget()
+        log_layout = QVBoxLayout(log_page)
+        log_layout.setContentsMargins(6, 6, 6, 6)
+        log_layout.setSpacing(6)
+        self.imu_log_text = QPlainTextEdit()
+        self.imu_log_text.setReadOnly(True)
+        self.imu_log_text.setMaximumBlockCount(1000)
+        self.imu_log_text.setFont(QFont("Courier New", 9))
+        log_btn_layout = QHBoxLayout()
+        log_btn_layout.setSpacing(6)
+        self.clear_log_btn = self._bind_text(QPushButton(), "Clear Log")
+        self.save_log_btn = self._bind_text(QPushButton(), "Save Log to CSV")
+        self.logging_cb = QCheckBox(tr("Auto Log"))
+        self._text_bindings.append((self.logging_cb, "Auto Log", "setText"))
+        self.logging_cb.setChecked(True)
+        log_btn_layout.addWidget(self.logging_cb)
+        log_btn_layout.addWidget(self.clear_log_btn)
+        log_btn_layout.addWidget(self.save_log_btn)
+        log_btn_layout.addStretch(1)
+        log_layout.addWidget(self.imu_log_text)
+        log_layout.addLayout(log_btn_layout)
+        detail_tabs.addTab(log_page, tr("IMU Data Log"))
+
+        self.imu_detail_tabs = detail_tabs
+        side_layout.addWidget(detail_tabs, stretch=1)
+
+        self.imu_splitter = QSplitter(Qt.Horizontal)
+        self.imu_splitter.addWidget(self.imu_3d_view)
+        self.imu_splitter.addWidget(side)
+        self.imu_splitter.setChildrenCollapsible(False)
+        self.imu_splitter.setStretchFactor(0, 3)
+        self.imu_splitter.setStretchFactor(1, 2)
+        self.imu_splitter.setSizes([860, 520])
+        layout.addWidget(self.imu_splitter, stretch=1)
 
         self.imu_poll_cb.toggled.connect(self.toggle_imu_polling)
         self.imu_poll_interval.valueChanged.connect(self.update_imu_poll_interval)
@@ -863,23 +985,62 @@ class MainWindow(QMainWindow):
     # ---------- 通信和数据处理 ----------
     def update_interface_visibility(self):
         is_serial = self.interface_combo.currentData() == "serial"
-        self.serial_port_combo.setEnabled(is_serial)
+        self.serial_port_list.setEnabled(is_serial)
         self.refresh_ports_btn.setEnabled(is_serial)
+        self.auto_refresh_ports_cb.setEnabled(is_serial)
         self.baudrate_combo.setEnabled(is_serial)
         self.can_channel_edit.setEnabled(not is_serial)
         self.can_bustype_combo.setEnabled(not is_serial)
         self.can_bitrate_edit.setEnabled(not is_serial)
+        self._update_port_refresh_timer()
+
+    def _on_auto_refresh_ports_toggled(self, _checked):
+        self._update_port_refresh_timer()
+
+    def _update_port_refresh_timer(self):
+        """仅在连接页可见、未连接且用户勾选时轮询串口列表。"""
+        should_run = (self.tabs.currentIndex() == TAB_CONNECTION
+                      and self.comm_backend is None
+                      and self.auto_refresh_ports_cb.isChecked())
+        if should_run and not self.port_refresh_timer.isActive():
+            self.refresh_serial_ports()
+            self.port_refresh_timer.start()
+        elif not should_run and self.port_refresh_timer.isActive():
+            self.port_refresh_timer.stop()
+
+    def selected_serial_port(self):
+        item = self.serial_port_list.currentItem()
+        return item.text() if item is not None else ""
 
     def refresh_serial_ports(self):
-        import serial.tools.list_ports
-        current = self.serial_port_combo.currentText()
-        self.serial_port_combo.clear()
-        ports = [p.device for p in serial.tools.list_ports.comports()]
-        self.serial_port_combo.addItems(ports)
-        if current in ports:
-            self.serial_port_combo.setCurrentText(current)
-        elif ports:
-            self.serial_port_combo.setCurrentIndex(0)
+        """增量刷新串口列表：新端口插到顶部，已有的端口保持原位和选中状态。"""
+        try:
+            import serial.tools.list_ports
+            ports = [p.device for p in serial.tools.list_ports.comports()]
+        except Exception:
+            return
+
+        selected = self.selected_serial_port()
+        existing = [self.serial_port_list.item(i).text()
+                    for i in range(self.serial_port_list.count())]
+
+        # 拔掉的端口移除
+        for i in range(self.serial_port_list.count() - 1, -1, -1):
+            if self.serial_port_list.item(i).text() not in ports:
+                self.serial_port_list.takeItem(i)
+
+        # 新出现的端口按枚举顺序插到顶部（最后插入的排最前）
+        for port in ports:
+            if port not in existing:
+                self.serial_port_list.insertItem(0, port)
+
+        if selected:
+            for i in range(self.serial_port_list.count()):
+                if self.serial_port_list.item(i).text() == selected:
+                    self.serial_port_list.setCurrentRow(i)
+                    return
+        if self.serial_port_list.count() and self.serial_port_list.currentRow() < 0:
+            self.serial_port_list.setCurrentRow(0)
 
     def toggle_connection(self):
         if self.comm_backend:
@@ -889,7 +1050,7 @@ class MainWindow(QMainWindow):
 
     def connect_device(self):
         if self.interface_combo.currentData() == "serial":
-            port = self.serial_port_combo.currentText()
+            port = self.selected_serial_port()
             if not port:
                 QMessageBox.warning(self, tr("Error"), tr("No serial port"))
                 return
@@ -916,8 +1077,13 @@ class MainWindow(QMainWindow):
         # 只恢复当前可见标签页的轮询，其余等待用户切过去
         self._apply_polling_gates()
 
+        # 连上后立刻自动广播一次电机 ID 检测，省去手动点按钮
+        self.detect_motor_id(auto=True)
+
     def disconnect(self):
         self.stop_auto_refresh()
+        self.detect_timeout_timer.stop()
+        self.detect_pending = False
         if self.comm_backend:
             try:
                 self.comm_backend.packet_received.disconnect(self.on_packet_received)
@@ -934,6 +1100,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText(tr("Not connected"))
         self._refresh_status_color()
         self.motor_id = None
+        self.detected_ids = []
         self.motor_id_label.setText(tr("None"))
         self.motor_id_combo.clear()
         self.motor_id_combo.addItem(tr("None"), None)
@@ -1005,10 +1172,46 @@ class MainWindow(QMainWindow):
         scrollbar = self.manual_response_text.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
-    def detect_motor_id(self):
+    def detect_motor_id(self, auto=False):
+        if not self.comm_backend:
+            return
+        if self.detect_pending:
+            # 上一次广播还没等到应答，不重复发送
+            return
+        self.detect_pending = True
+        self.detect_auto = auto
+        self.detect_btn.setEnabled(False)
+        self.status_label.setText(tr("Searching for motor ID..."))
+        self._refresh_status_color()
         self.send_command(0x00, 0x00, motor_id=0xFFFF)
+        self.detect_timeout_timer.start(DETECT_TIMEOUT_MS)
+
+    def on_detect_timeout(self):
+        """广播后超时仍无应答：提示用户并恢复按钮。"""
+        if not self.detect_pending:
+            return
+        self.detect_pending = False
+        self.detect_auto = False
+        if self.comm_backend is not None:
+            self.detect_btn.setEnabled(True)
+        if self.detected_ids:
+            self.status_label.setText(tr("Connected"))
+        else:
+            self.status_label.setText(tr("Motor ID not detected"))
+        self._refresh_status_color()
+        QMessageBox.warning(self, tr("Detect"), tr("Motor ID not detected"))
+
+    def _finish_detect(self):
+        self.detect_timeout_timer.stop()
+        auto = self.detect_auto
+        self.detect_pending = False
+        self.detect_auto = False
+        if self.comm_backend is not None:
+            self.detect_btn.setEnabled(True)
+        return auto
 
     def handle_detect_response(self, packet):
+        auto = self._finish_detect()
         ids = []
         for i in range(1,5):
             val = getattr(packet, f'data{i}').as_uint32()
@@ -1021,15 +1224,25 @@ class MainWindow(QMainWindow):
         ids = list(set(ids))
         self.detected_ids = ids
         self.motor_id_combo.clear()
+        connected = self.comm_backend is not None
         if ids:
             for i in ids:
                 self.motor_id_combo.addItem(str(i), i)
             self.motor_id = ids[0]
             self.motor_id_label.setText(str(ids[0]))
-            QMessageBox.information(self, tr("Detect"),
-                                    tr("Detected IDs: {}").format(ids))
+            if connected:
+                self.status_label.setText(tr("Connected"))
+                self._refresh_status_color()
+            # 连接后自动检测不再弹窗打扰，手动检测仍然给出确认
+            if not auto:
+                QMessageBox.information(self, tr("Detect"),
+                                        tr("Detected IDs: {}").format(ids))
         else:
-            QMessageBox.warning(self, tr("Detect"), tr("No motor found"))
+            if connected:
+                self.status_label.setText(tr("Motor ID not detected"))
+                self._refresh_status_color()
+            if not auto:
+                QMessageBox.warning(self, tr("Detect"), tr("No motor found"))
 
     def set_motor_mode(self):
         mode = self.mode_combo.currentData()
@@ -1195,6 +1408,7 @@ class MainWindow(QMainWindow):
     def on_tab_changed(self, index):
         # 切换标签页时重新评估：只有当前可见页对应的轮询才继续请求数据
         self._apply_polling_gates()
+        # 连接页的串口列表只在可见时轮询（_apply_polling_gates 已处理）
 
     def _apply_polling_gates(self):
         """按"用户意图 + 当前可见标签页 + 连接状态"统一启停各类轮询。
@@ -1205,6 +1419,9 @@ class MainWindow(QMainWindow):
         connected = self.comm_backend is not None
         index = self.tabs.currentIndex()
         motor_id = self.get_current_motor_id()
+
+        # 0. 连接页的串口列表自动刷新
+        self._update_port_refresh_timer()
 
         # 1. 实时数据页的曲线轮询
         real_time_ok = (index == TAB_REALTIME_DATA and connected

@@ -292,6 +292,32 @@ QComboBox QAbstractItemView {
     selection-color: %(accent_text)s;
 }
 
+/* ---------- list widgets ---------- */
+QListWidget, QListView {
+    background-color: %(base)s;
+    color: %(text)s;
+    border: 1px solid %(border)s;
+    border-radius: 5px;
+    outline: none;
+    padding: 2px;
+}
+QListWidget::item, QListView::item {
+    padding: 3px 6px;
+    border-radius: 3px;
+}
+QListWidget::item:hover, QListView::item:hover {
+    background-color: %(button_hover)s;
+}
+QListWidget::item:selected, QListView::item:selected {
+    background-color: %(accent)s;
+    color: %(accent_text)s;
+}
+QListWidget:disabled, QListView:disabled {
+    background-color: %(button_disabled)s;
+    color: %(text_disabled)s;
+    border-color: %(border_soft)s;
+}
+
 /* ---------- spin boxes ---------- */
 QSpinBox::up-button, QDoubleSpinBox::up-button {
     subcontrol-origin: border;

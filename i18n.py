@@ -245,6 +245,9 @@ _ZH_CN = {
     "Save Config As": "配置另存为",
     "Saved to {}": "已保存至 {}",
     "Save failed: {}": "保存失败：{}",
+    "Auto-refresh ports": "自动刷新串口",
+    "Searching for motor ID...": "正在搜索电机 ID...",
+    "Motor ID not detected": "未检测到电机 ID",
 }
 
 _ZH_TW = {
@@ -471,6 +474,9 @@ _ZH_TW = {
     "Save Config As": "設定另存新檔",
     "Saved to {}": "已儲存至 {}",
     "Save failed: {}": "儲存失敗：{}",
+    "Auto-refresh ports": "自動重新整理序列埠",
+    "Searching for motor ID...": "正在搜尋馬達 ID...",
+    "Motor ID not detected": "未偵測到馬達 ID",
 }
 
 _TRANSLATIONS = {

@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 
 import math
-from PyQt5.QtWidgets import QWidget
-from PyQt5.QtCore import Qt, QPointF
+from PyQt5.QtWidgets import QWidget, QSizePolicy
+from PyQt5.QtCore import Qt, QPointF, QSize
 from PyQt5.QtGui import QPainter, QPen, QBrush, QColor, QFont, QPolygonF
 
 
@@ -21,7 +21,13 @@ class MotorPreviewWidget(QWidget):
         self.current_angle = 0.0
         self.colors = dict(self.DEFAULT_COLORS)
         self.setMinimumSize(200, 200)
-        self.setMaximumSize(300, 300)
+        # 原来 300px 的硬上限让表盘偏小；放宽到 340px 让它随标签页一起变大。
+        # paintEvent 会把绘制区居中成正方形，所以容器不是正方形也不会变形。
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        self.setMaximumSize(340, 340)
+
+    def sizeHint(self):
+        return QSize(320, 320)
 
     def set_colors(self, colors):
         """应用主题配色（来自 theme.palette()）。"""
