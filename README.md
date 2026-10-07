@@ -32,6 +32,7 @@ Motor GUI for motor control, monitoring, tuning, and IMU visualization.
 - Stillness-gated gyro calibration and complementary filter attitude estimation
 - Light and dark themes
 - UI languages: English, 简体中文, 繁體中文
+- Only the visible tab polls the device, so background tabs cost no bandwidth
 
 ## Project Files
 
@@ -122,6 +123,32 @@ on the next launch:
 `config/settings.json` is a settings file, not a motor profile, so it is hidden
 from the configuration dropdown in the Motor Control tab. Delete it to fall back
 to the defaults (`light` + `en`).
+
+## Polling and Bandwidth
+
+The GUI only requests data for the tab you are currently looking at. Each kind of
+polling belongs to one tab:
+
+| Polling | Tab | Default interval |
+| --- | --- | --- |
+| Curve data (`Ia/Ib/Ic`, `Iq/Id`, speed, position) | Real-time Data | 50 ms |
+| Motor preview + phase currents | Motor Control | 50 ms / 300 ms |
+| Parameter auto refresh | Motor Control | 1000 ms |
+| IMU attitude packets | IMU 3D Display | 100 ms |
+
+When you switch to another tab, the timers owned by the tab you left are stopped
+and no further requests are sent on the bus. Switching back resumes them
+automatically, so a checkbox you ticked stays ticked and its polling restarts.
+
+Notes:
+
+- This is unconditional — there is no option to keep a background tab polling.
+  Keep the owning tab open if you need its data to keep flowing.
+- IMU gyro calibration is **preserved** across tab switches. Leaving the IMU tab
+  pauses the stream only; the measured gyro bias and the current attitude are
+  kept, and the timestamp is re-stamped on resume so the paused time is not
+  integrated as motion.
+- Disconnecting stops every poller regardless of the visible tab.
 
 ## Usage
 

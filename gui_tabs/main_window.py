@@ -50,6 +50,11 @@ DEFAULT_CUBE = "Default Cube"
 TAB_KEYS = ["Connection", "Motor Control", "PID Tuning", "Real-time Data",
             "Limits", "Manual", "IMU 3D"]
 
+# 各类轮询各自归属的标签页，只有该页可见时才允许请求数据
+TAB_MOTOR_CONTROL = TAB_KEYS.index("Motor Control")
+TAB_REALTIME_DATA = TAB_KEYS.index("Real-time Data")
+TAB_IMU = TAB_KEYS.index("IMU 3D")
+
 # ==================== 互补滤波器（带限幅和衰减） ====================
 class ComplementaryFilter:
     def __init__(self, dt=0.02, alpha=0.92, max_rate_dps=1000.0, accel_gate_dps=20.0):
@@ -124,6 +129,9 @@ class MainWindow(QMainWindow):
         self.comm_backend = None
         self.motor_id = None
         self.detected_ids = []
+        # 下面几个 *_enabled 标志表示「当前是否真的在轮询」，而不是用户的勾选状态。
+        # 勾选状态由各自的复选框保存，两者由 _apply_polling_gates() 统一同步，
+        # 因此离开对应标签页时轮询会暂停，切回来再自动恢复。
         self.poll_timer = QTimer()
         self.poll_timer.timeout.connect(self.poll_data)
         self.poll_enabled = False
@@ -139,6 +147,12 @@ class MainWindow(QMainWindow):
         self.busy_start = 0
         self.busy_timeout = 150
         self.preview_toggle = True
+
+        # 参数自动刷新（电机控制页），同样只在当前页可见时运行
+        self.auto_refresh_timer = QTimer()
+        self.auto_refresh_timer.timeout.connect(self.refresh_all_except_mode)
+        self.auto_refresh_timer_running = False
+        self.auto_refresh_interval_ms = 1000
 
         self.gear_ratio_num = 1.0
         self.gear_ratio_den = 1.0
@@ -209,6 +223,9 @@ class MainWindow(QMainWindow):
         ]
         for i, (factory, force_scroll) in enumerate(tab_factories):
             self.tabs.addTab(self._wrap_scrollable(factory(), force_scroll), tr(TAB_KEYS[i]))
+
+        # 切页时重新评估门控，只让当前标签页继续请求数据
+        self.tabs.currentChanged.connect(self.on_tab_changed)
 
         self.status_label = QLabel(tr("Not connected"))
         self.statusBar().addWidget(self.status_label)
@@ -563,6 +580,7 @@ class MainWindow(QMainWindow):
         self.refresh_interval_spin.setRange(100,5000)
         self.refresh_interval_spin.setValue(1000)
         self.refresh_interval_spin.setSuffix(tr(" ms"))
+        self.refresh_interval_spin.valueChanged.connect(self.on_auto_refresh_interval_changed)
         auto_layout.addWidget(self.auto_refresh_cb)
         auto_layout.addWidget(self._label("Interval:"))
         auto_layout.addWidget(self.refresh_interval_spin)
@@ -895,8 +913,8 @@ class MainWindow(QMainWindow):
         self.status_label.setText(tr("Connected"))
         self._refresh_status_color()
 
-        if self.preview_auto_cb.isChecked():
-            self.start_auto_refresh()
+        # 只恢复当前可见标签页的轮询，其余等待用户切过去
+        self._apply_polling_gates()
 
     def disconnect(self):
         self.stop_auto_refresh()
@@ -909,6 +927,8 @@ class MainWindow(QMainWindow):
                 pass
             self.comm_backend.stop()
             self.comm_backend = None
+        # 先停掉 IMU 轮询，避免它随后覆盖"Not connected"状态文字
+        self.imu_poll_cb.setChecked(False)
         self.connect_btn.setText(tr("Connect"))
         self.detect_btn.setEnabled(False)
         self.status_label.setText(tr("Not connected"))
@@ -917,7 +937,7 @@ class MainWindow(QMainWindow):
         self.motor_id_label.setText(tr("None"))
         self.motor_id_combo.clear()
         self.motor_id_combo.addItem(tr("None"), None)
-        self.imu_poll_cb.setChecked(False)
+        self._apply_polling_gates()
 
     def send_command(self, func2, func3, data1=0, data2=0, data3=0, data4=0, motor_id=0):
         if not self.comm_backend:
@@ -1165,16 +1185,66 @@ class MainWindow(QMainWindow):
             tr("Actual Angle: {}°  (Rot: {}, Mod: {}°)").format(actual_angle, tot, mod))
 
     def toggle_polling(self, enabled):
-        if enabled:
-            if self.motor_id is None:
-                QMessageBox.warning(self, tr("Polling"), tr("Detect motor ID first"))
-                self.poll_checkbox.setChecked(False)
-                return
+        if enabled and self.motor_id is None:
+            QMessageBox.warning(self, tr("Polling"), tr("Detect motor ID first"))
+            self.poll_checkbox.setChecked(False)
+            return
+        # 复选框只表达用户意图，实际启停交给门控判断当前页是否可见
+        self._apply_polling_gates()
+
+    def on_tab_changed(self, index):
+        # 切换标签页时重新评估：只有当前可见页对应的轮询才继续请求数据
+        self._apply_polling_gates()
+
+    def _apply_polling_gates(self):
+        """按"用户意图 + 当前可见标签页 + 连接状态"统一启停各类轮询。
+
+        每个 *_enabled 标志只表示"此刻真的在轮询"，用户勾选状态始终以复选框为准，
+        这样切回标签页或重新勾选时都能恢复到之前的状态。
+        """
+        connected = self.comm_backend is not None
+        index = self.tabs.currentIndex()
+        motor_id = self.get_current_motor_id()
+
+        # 1. 实时数据页的曲线轮询
+        real_time_ok = (index == TAB_REALTIME_DATA and connected
+                        and self.poll_checkbox.isChecked() and self.motor_id is not None)
+        if real_time_ok and not self.poll_enabled:
             self.poll_enabled = True
             self.poll_timer.start(50)
-        else:
+        elif not real_time_ok and self.poll_enabled:
             self.poll_enabled = False
             self.poll_timer.stop()
+
+        # 2/3. 电机控制页的预览与相电流轮询
+        preview_ok = (index == TAB_MOTOR_CONTROL and connected and motor_id != 0
+                      and self.preview_auto_cb.isChecked())
+        if preview_ok and not self.auto_refresh_enabled:
+            self.start_auto_refresh()
+        elif not preview_ok and self.auto_refresh_enabled:
+            self.stop_auto_refresh()
+
+        # 暂停/恢复都可能留下未完成的请求，清掉以免恢复后卡住
+        if not preview_ok:
+            self.is_busy = False
+
+        # 4. 电机控制页的参数自动刷新
+        self._sync_auto_refresh_timer(
+            index == TAB_MOTOR_CONTROL and connected and motor_id != 0
+            and self.auto_refresh_cb.isChecked())
+
+        # 5. IMU 3D 页的数据轮询
+        imu_ok = (index == TAB_IMU and connected and self.imu_poll_cb.isChecked())
+        if imu_ok and not self.imu_poll_enabled:
+            self.imu_poll_enabled = True
+            # 恢复轮询时重新打时间戳，避免把暂停时长算进积分
+            self.last_imu_time = time.time()
+            self.imu_poll_timer.start(self.imu_poll_interval.value())
+            self.request_imu_data()
+        elif not imu_ok and self.imu_poll_enabled:
+            # 只暂停，保留校准结果，切回来可以直接继续
+            self.imu_poll_enabled = False
+            self.imu_poll_timer.stop()
 
     def change_plot_type(self, plot_type):
         self.poll_type = plot_type.lower()
@@ -1356,26 +1426,35 @@ class MainWindow(QMainWindow):
         self.busy_start = time.time() * 1000
 
     def toggle_preview_auto_refresh(self, enabled):
-        if enabled and self.comm_backend and self.get_current_motor_id() != 0:
-            self.start_auto_refresh()
-        else:
-            self.stop_auto_refresh()
+        # 只记录意图，实际启停由门控按当前可见标签页决定
+        self._apply_polling_gates()
 
     def on_motor_id_changed(self):
         if hasattr(self, 'speed_label'):
             self.speed_label.setText(tr("Motor Speed: --- rpm"))
         if self.auto_refresh_enabled:
             self.is_busy = False
+        self._apply_polling_gates()
 
     def toggle_auto_refresh(self, enabled):
-        if enabled:
-            self.auto_refresh_timer = QTimer()
-            self.auto_refresh_timer.timeout.connect(self.refresh_all_except_mode)
-            self.auto_refresh_timer.start(self.refresh_interval_spin.value())
-            self.refresh_all_except_mode()
+        # 只记录意图，实际启停由门控按当前可见标签页决定
+        self._apply_polling_gates()
+
+    def _sync_auto_refresh_timer(self, should_run):
+        if should_run:
+            self.auto_refresh_timer.start(self.auto_refresh_interval_ms)
+            if not self.auto_refresh_timer_running:
+                # 仅在由停转启时补一次参数刷新，避免与定时器重复请求
+                self.auto_refresh_timer_running = True
+                self.refresh_all_except_mode()
         else:
-            if hasattr(self, 'auto_refresh_timer'):
-                self.auto_refresh_timer.stop()
+            self.auto_refresh_timer.stop()
+            self.auto_refresh_timer_running = False
+
+    def on_auto_refresh_interval_changed(self, value):
+        self.auto_refresh_interval_ms = value
+        if self.auto_refresh_timer.isActive():
+            self.auto_refresh_timer.start(value)
 
     def refresh_all_except_mode(self):
         mid = self.get_current_motor_id()
@@ -1580,7 +1659,7 @@ class MainWindow(QMainWindow):
         scrollbar.setValue(scrollbar.maximum())
 
     def toggle_imu_polling(self, enabled):
-        self.imu_poll_enabled = enabled
+        # enabled 表示用户意图；真正是否轮询由 _apply_polling_gates() 决定
         if enabled:
             self.calibrating_gyro = True
             self.calib_samples = 0
@@ -1590,15 +1669,13 @@ class MainWindow(QMainWindow):
             self.filter = ComplementaryFilter(dt=0.02, alpha=0.92)
             self.last_imu_time = time.time()
             self.status_label.setText(tr("IMU calibrating... Keep device still"))
-            self.imu_poll_timer.start(self.imu_poll_interval.value())
-            self.request_imu_data()
         else:
-            self.imu_poll_timer.stop()
             self.calibrating_gyro = False
             self.status_label.setText(tr("IMU polling stopped"))
+        self._apply_polling_gates()
 
     def update_imu_poll_interval(self):
-        if self.imu_poll_enabled:
+        if self.imu_poll_timer.isActive():
             self.imu_poll_timer.start(self.imu_poll_interval.value())
 
     # ---------- 3D 模型相关 ----------
