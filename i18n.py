@@ -106,6 +106,10 @@ _ZH_CN = {
     "Set All": "全部设置",
     "Get All": "全部读取",
     "Get Speed": "读取速度",
+    "Each Set button sends only that value; Speed/Position also switch the mode":
+        "每个 Set 按钮只发送该项数值；速度/位置会同时切换工作模式",
+    "Active target for the current mode": "当前模式下生效的目标值",
+    "Not used by the current mode": "当前模式不使用该目标值",
 
     # ── phase currents ────────────────────────────────────────────
     "Phase Currents": "相电流",
@@ -205,6 +209,9 @@ _ZH_CN = {
     "IMU data copied to clipboard": "IMU 数据已复制到剪贴板",
     "IMU calibrating... Keep device still": "IMU 校准中…请保持设备静止",
     "IMU polling stopped": "IMU 轮询已停止",
+    "IMU outlier frame discarded": "已丢弃 IMU 异常帧",
+    "IMU bad accel frame skipped": "已跳过 IMU 加速度异常帧",
+    "IMU inconsistent gyro frame skipped": "已跳过 IMU 角速度异常帧（与加速度计不一致）",
     "Calibrating IMU... {}/{}": "IMU 校准中… {}/{}",
     "IMU ready (bias: {}, {}, {})": "IMU 就绪（零偏：{}, {}, {}）",
 
@@ -248,6 +255,11 @@ _ZH_CN = {
     "Auto-refresh ports": "自动刷新串口",
     "Searching for motor ID...": "正在搜索电机 ID...",
     "Motor ID not detected": "未检测到电机 ID",
+    "Zoom": "缩放",
+    "Zoom In": "放大",
+    "Zoom Out": "缩小",
+    "Reset Zoom": "重置缩放",
+    "Zoom:": "缩放：",
 }
 
 _ZH_TW = {
@@ -335,6 +347,10 @@ _ZH_TW = {
     "Set All": "全部設定",
     "Get All": "全部讀取",
     "Get Speed": "讀取轉速",
+    "Each Set button sends only that value; Speed/Position also switch the mode":
+        "每個 Set 按鈕只發送該項數值；速度/位置會同時切換工作模式",
+    "Active target for the current mode": "目前模式下生效的目標值",
+    "Not used by the current mode": "目前模式不使用該目標值",
 
     # ── phase currents ────────────────────────────────────────────
     "Phase Currents": "相電流",
@@ -434,6 +450,9 @@ _ZH_TW = {
     "IMU data copied to clipboard": "IMU 資料已複製到剪貼簿",
     "IMU calibrating... Keep device still": "IMU 校正中…請保持裝置靜止",
     "IMU polling stopped": "IMU 輪詢已停止",
+    "IMU outlier frame discarded": "已丟棄 IMU 異常幀",
+    "IMU bad accel frame skipped": "已略過 IMU 加速度異常幀",
+    "IMU inconsistent gyro frame skipped": "已略過 IMU 角速度異常幀（與加速度計不一致）",
     "Calibrating IMU... {}/{}": "IMU 校正中… {}/{}",
     "IMU ready (bias: {}, {}, {})": "IMU 就緒（零偏：{}, {}, {}）",
 
@@ -477,6 +496,11 @@ _ZH_TW = {
     "Auto-refresh ports": "自動重新整理序列埠",
     "Searching for motor ID...": "正在搜尋馬達 ID...",
     "Motor ID not detected": "未偵測到馬達 ID",
+    "Zoom": "縮放",
+    "Zoom In": "放大",
+    "Zoom Out": "縮小",
+    "Reset Zoom": "重設縮放",
+    "Zoom:": "縮放：",
 }
 
 _TRANSLATIONS = {

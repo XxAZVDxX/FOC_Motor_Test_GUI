@@ -8,9 +8,10 @@ consistently.
 """
 
 import os
+import re
 
 import pyqtgraph as pg
-from PyQt5.QtGui import QColor, QPalette
+from PyQt5.QtGui import QColor, QFont, QPalette
 
 THEMES = [
     ("light", "Light"),
@@ -18,6 +19,19 @@ THEMES = [
 ]
 
 DEFAULT_THEME = "light"
+
+# ---------- view zoom ----------
+# The stylesheet carries every metric, so scaling it scales the whole UI.
+# Fractional pt/px values are accepted by Qt, which keeps the steps smooth.
+MIN_ZOOM = 50
+MAX_ZOOM = 250
+ZOOM_STEP = 10
+DEFAULT_ZOOM = 100
+ZOOM_LEVELS = list(range(MIN_ZOOM, MAX_ZOOM + 1, ZOOM_STEP))
+_BASE_FONT_PT = 9.0
+_PLOT_FONT_PT = 12.0
+_LEGEND_FONT_PT = 9.0
+_LENGTH_RE = re.compile(r"(-?\d+(?:\.\d+)?)(px|pt)")
 
 _ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 _CHECK_ICON = os.path.join(_ASSET_DIR, "check.svg").replace("\\", "/")
@@ -473,11 +487,45 @@ def palette(theme_name):
     return dict(_PALETTES.get(theme_name, _PALETTES[DEFAULT_THEME]))
 
 
-def stylesheet(theme_name):
-    """Return the full Qt stylesheet for ``theme_name``."""
+def clamp_zoom(zoom):
+    """Coerce ``zoom`` into one of the supported percentages."""
+    try:
+        value = int(round(float(zoom)))
+    except (TypeError, ValueError):
+        return DEFAULT_ZOOM
+    value = max(MIN_ZOOM, min(MAX_ZOOM, value))
+    # Snap to the nearest preset so the zoom dropdown always has a matching entry.
+    return min(ZOOM_LEVELS, key=lambda level: abs(level - value))
+
+
+def _format_length(value):
+    text = "%.2f" % value
+    text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def scale_qss(qss, factor):
+    """Scale every ``px`` / ``pt`` metric in a stylesheet by ``factor``."""
+    if factor == 1.0:
+        return qss
+
+    def _replace(match):
+        value = float(match.group(1))
+        unit = match.group(2)
+        scaled = value * factor
+        if value > 0 and scaled < 1.0:
+            # Keep borders and paddings visible when zooming far out.
+            scaled = 1.0
+        return _format_length(scaled) + unit
+
+    return _LENGTH_RE.sub(_replace, qss)
+
+
+def stylesheet(theme_name, zoom=DEFAULT_ZOOM):
+    """Return the full Qt stylesheet for ``theme_name`` scaled by ``zoom``."""
     colors = palette(theme_name)
     colors["check_icon"] = _CHECK_ICON
-    return _QSS % colors
+    return scale_qss(_QSS % colors, clamp_zoom(zoom) / 100.0)
 
 
 def _build_qpalette(colors):
@@ -509,16 +557,58 @@ def _build_qpalette(colors):
     return qp
 
 
-def apply_theme(app, theme_name):
+def apply_theme(app, theme_name, zoom=DEFAULT_ZOOM):
     """Apply ``theme_name`` to the whole application.  Returns the palette."""
     colors = palette(theme_name)
     app.setPalette(_build_qpalette(colors))
-    app.setStyleSheet(stylesheet(theme_name))
+    app.setStyleSheet(stylesheet(theme_name, zoom))
 
     # pyqtgraph defaults for plots created after this point
     pg.setConfigOption("background", colors["plot_bg"])
     pg.setConfigOption("foreground", colors["plot_axis"])
     return colors
+
+
+def _legend(plot_widget):
+    """Return the legend of a ``PlotWidget`` (``PlotWidget.__getattr__`` hides it)."""
+    plot_item = getattr(plot_widget, "plotItem", None)
+    return getattr(plot_item, "legend", None) if plot_item is not None else None
+
+
+def apply_plot_zoom(plot_widget, zoom=DEFAULT_ZOOM):
+    """Scale the fonts of an existing pyqtgraph plot.
+
+    pyqtgraph ignores both the application stylesheet and ``QApplication.font()``,
+    so its axis ticks, axis labels and legend need to be sized explicitly.
+    """
+    factor = clamp_zoom(zoom) / 100.0
+    family = plot_widget.font().family()
+
+    for axis_name in ("left", "bottom", "right", "top"):
+        axis = plot_widget.getAxis(axis_name)
+        if axis is None:
+            continue
+        tick_font = QFont(family)
+        tick_font.setPointSizeF(_PLOT_FONT_PT * factor)
+        axis.setTickFont(tick_font)
+
+        # setLabel() replaces labelStyle wholesale, so the axis colours have to be
+        # re-passed.  siPrefixEnableRanges is private and must not be touched here.
+        style = dict(axis.labelStyle)
+        style["font-size"] = "%spt" % _format_length(_PLOT_FONT_PT * factor)
+        axis.setLabel(
+            axis.labelText,
+            axis.labelUnits,
+            unitPrefix=axis.labelUnitPrefix,
+            unitPower=axis.unitPower,
+            **style
+        )
+
+    legend = _legend(plot_widget)
+    if legend is not None:
+        legend.setLabelTextSize("%spt" % _format_length(_LEGEND_FONT_PT * factor))
+        # 让图例立刻按新字号重新排布，而不是等下一次重绘
+        legend.updateSize()
 
 
 def apply_plot_theme(plot_widget, theme_name):
@@ -531,7 +621,7 @@ def apply_plot_theme(plot_widget, theme_name):
             continue
         axis.setPen(pg.mkPen(colors["plot_axis"]))
         axis.setTextPen(pg.mkPen(colors["plot_axis"]))
-    legend = getattr(plot_widget, "legend", None)
+    legend = _legend(plot_widget)
     if legend is not None:
         for _sample, label in legend.items:
             label.setText(label.text, color=colors["plot_axis"])

@@ -23,6 +23,9 @@ Motor GUI for motor control, monitoring, tuning, and IMU visualization.
   - Speed
   - Position
   - Uq / Ud
+- Per-value **Set** buttons: each sends only its own target, and Speed/Position also switch the motor to the matching closed loop
+- The target that is active for the current mode is highlighted in bold
+- **Stop** button and a mode indicator that follow the real operating mode
 - PID tuning interface
 - Limits configuration
 - Real-time data monitoring
@@ -30,7 +33,7 @@ Motor GUI for motor control, monitoring, tuning, and IMU visualization.
 - Manual hex command sending
 - IMU 3D visualization
 - Optional custom 3D model loading
-- Stillness-gated gyro calibration and complementary filter attitude estimation
+- Median-based gyro bias calibration, spike rejection and complementary filter attitude estimation
 - Light and dark themes
 - UI languages: English, 简体中文, 繁體中文
 - Only the visible tab polls the device, so background tabs cost no bandwidth
@@ -43,7 +46,7 @@ Motor GUI for motor control, monitoring, tuning, and IMU visualization.
 - `run.command` — launcher for macOS (double-click in Finder)
 - `theme.py` — light/dark palettes and the global stylesheet
 - `i18n.py` — translation catalog and the `tr()` lookup helper
-- `settings.py` — loads/saves the selected theme and language
+- `settings.py` — loads/saves the selected theme, language and zoom level
 - `assets/` — icons used by the stylesheet
 
 
@@ -105,10 +108,13 @@ model gets nearly the full tab height instead of a narrow strip.
 - **Right pane** — IMU readings in a compact grid, then a nested tab bar with
   **IMU Debug Data** (raw values plus *Copy Current IMU Data*) and
   **IMU Data Log** (rolling log plus *Clear Log* / *Save Log to CSV* / *Auto Log*).
+  The exported CSV starts with a `timestamp, ax(g), ... yaw(deg)` header line so
+  the columns are self-describing; the gyro columns are the raw, pre-bias values,
+  which makes a calibration problem visible in the export.
 
-### Motor Control, PID Tuning, Limits and Manual layouts
+### Motor Control, PID Tuning, Limits, Manual and Connection layouts
 
-These four tabs were re-laid out so that controls that used to be stacked
+These tabs were re-laid out so that controls that used to be stacked
 vertically now sit side by side, which cuts each tab's minimum width and leaves
 far less empty space on a wide screen.
 
@@ -116,15 +122,25 @@ far less empty space on a wide screen.
   full width on top; **Operating Mode** / **Motor Parameters** sit in the left
   column and **Motor Selection** / **Target Values** in the right; **Phase
   Currents** / **Auto Refresh** share the next row. The six *Target Values*
-  spin boxes are paired two per row instead of six rows. The motor preview spans
-  the bottom with its readings in a two-column grid underneath the dial.
+  entries each occupy a `label | spin box | Set` triplet, paired two per row, so
+  every value can be sent on its own without touching the other five. The speed
+  read-back is scaled by `FIRMWARE_SPEED_READBACK_SCALE` (`1.0` for the patched
+  firmware) and never overwrites a value you are still typing
+  (see *Firmware speed read-back scaling*). The motor
+  preview spans the bottom with its readings in a two-column grid underneath the
+  dial.
 - **PID Tuning** — the four PID groups form a 2×2 grid instead of a tall column.
 - **Limits** — each limit gets a `label | max | min | label` row, turning eight
   rows into four.
 - **Manual** — the command and response boxes share a draggable vertical
   splitter, so the response area grows with the window.
-- **Connection** — the serial port picker is a **list** rather than a dropdown,
-  so every available port is visible at once.
+- **Connection** — the interface picker moved to its own row at the top, and the
+  Serial and CAN settings now live in separate group boxes so only the group for
+  the selected interface is shown (Serial **or** CAN). The *Connect* /
+  *Detect Motor ID* buttons and the detected-ID label sit in one action bar
+  underneath, and the serial port list was shortened from 96–140 px to
+  72–96 px. The serial port picker is a **list** rather than a dropdown, so
+  every available port is still visible at once.
 
 ### Serial port list and automatic motor ID detection
 
@@ -151,9 +167,10 @@ you do not have to press **Detect Motor ID** after every connection:
 The **Detect Motor ID** button is kept for manual re-detection; it is disabled
 while a detection is already pending.
 
-## Appearance and Language
+## Appearance, Zoom and Language
 
-Both settings live in the **View** menu and apply immediately — no restart needed.
+These settings live in the **View** menu and apply immediately — no restart
+needed.
 
 ### Theme
 
@@ -162,6 +179,23 @@ Both settings live in the **View** menu and apply immediately — no restart nee
 The theme restyles the whole window: widget palette, tab bar, status bar,
 buttons, the phase-current labels, the 2D motor preview and the IMU 3D
 background.
+
+### Zoom
+
+**View → Zoom In / Zoom Out / Reset Zoom** or the percentage dropdown at the
+right end of the status bar.
+
+| Action | Shortcut |
+| --- | --- |
+| Zoom in (+10 %) | `Ctrl` / `⌘` + `+` (or `=`) |
+| Zoom out (−10 %) | `Ctrl` / `⌘` + `-` (or `_`) |
+| Reset to 100 % | `Ctrl` / `⌘` + `0` |
+
+Zoom ranges from 50 % to 250 % in 10 % steps and scales **everything**: fonts,
+padding, button and control sizes, the plot axes/labels/legend and the motor
+preview. Tabs that no longer fit are put inside a scroll area, so every control
+stays reachable on small screens. On macOS `Ctrl` is mapped to `⌘`
+automatically.
 
 ### Language
 
@@ -173,19 +207,24 @@ readings, plot labels) are not re-rendered until the next update.
 
 ### Persistence
 
-The chosen theme and language are written to `config/settings.json` and restored
-on the next launch:
+The chosen theme, language, zoom level and the last motor commands are written to
+`config/settings.json` and restored on the next launch:
 
 ```json
 {
   "theme": "light",
-  "language": "en"
+  "language": "en",
+  "zoom": 100,
+  "speed_cmd": 1200.0,
+  "position_cmd": 90.0
 }
 ```
 
 `config/settings.json` is a settings file, not a motor profile, so it is hidden
 from the configuration dropdown in the Motor Control tab. Delete it to fall back
-to the defaults (`light` + `en`).
+to the defaults (`light` + `en` + `100` + `0` + `0`). A `zoom` value outside 50–250,
+or one that is not a number, is ignored; `speed_cmd` and `position_cmd` are clamped
+to ±100000.
 
 ## Polling and Bandwidth
 
@@ -213,9 +252,9 @@ Notes:
   ticked. It never touches the bus, so it is stopped while connected to avoid
   pointless work.
 - IMU gyro calibration is **preserved** across tab switches. Leaving the IMU tab
-  pauses the stream only; the measured gyro bias and the current attitude are
-  kept, and the timestamp is re-stamped on resume so the paused time is not
-  integrated as motion.
+  pauses the stream only; the measured gyro bias, the median filter window and
+  the current attitude are kept, and the timestamp is re-stamped on resume so the
+  paused time is not integrated as motion.
 - Disconnecting stops every poller regardless of the visible tab.
 
 ## Usage
@@ -254,17 +293,172 @@ Available modes:
 - Speed loop
 - Position loop
 
+The target value that is actually in effect for the selected mode is drawn in
+**bold** in the Target Values group, so you can see at a glance which numbers the
+controller is currently using. Selecting **Stop** clears the emphasis.
+
 ### 4. Configure targets
 
-Depending on the control mode, set:
+The Target Values group shows six entries, each with its own **Set** button:
 
-- Iq target
-- Id target
-- Speed target
-- Position target
-- Uq / Ud target
+| Entry | Command sent by its Set button |
+| --- | --- |
+| Iq | `0x20` set-current |
+| Id | `0x21` set-current |
+| Speed (rpm) | `0x22` set-speed |
+| Position (deg) | `0x23` set-position |
+| Uq | `0x24` set-voltage (both words) |
+| Ud | `0x24` set-voltage (both words) |
 
-Then apply the values through the GUI.
+Each **Set** button transmits **only that single value**, so typing a speed no
+longer pushes a stale position along with it. Uq and Ud share one command, so
+either button sends both words together.
+
+**Speed and Position also switch the mode.** Pressing **Set** next to *Speed (rpm)*
+first sends the Speed-loop mode command and then the speed value, and *Position (deg)*
+does the same for the Position loop. The Operating Mode drop-down updates
+immediately, and the bold emphasis moves to the value you just sent. The other four
+entries never change the mode.
+
+The mode command and the target value are deliberately **not** written back to back.
+Switching into a closed loop makes the firmware initialise the current loop and reset
+the speed/position reference, and a target value that arrives during that window is
+treated as a disturbance, which shows up as the motor shaking left and right. So when
+the mode actually has to change, the GUI sends the mode command, waits
+`MODE_SWITCH_SETTLE_MS` (120 ms), and only then sends the target. When the Operating
+Mode drop-down already shows the loop you are targeting, no mode command is sent at
+all and the value goes out immediately.
+
+The command line follows the same order:
+
+1. Enter the value in the spin box (Speed and Position accept ±100000 with three
+   decimals, so you can type an exact target instead of stepping to it).
+2. Press the **Set** button to the right of that entry.
+3. Confirm the Operating Mode drop-down shows the loop you expect.
+
+#### Firmware speed read-back scaling
+
+`Get All` and the automatic 1 s refresh both read the current target values back from
+the controller. The controller's `motor_aim_speed_param()` stores the speed you send in
+two places:
+
+```c
+motorA.aim.aim_speed      = package.data1.f / motorA.as5047p.speed_rpm_param; /* rpm -> rad/s */
+motorA.aim.aim_speeed_rpm = package.data1.f;                                 /* the rpm you typed  */
+```
+
+The speed loop uses `aim_speed`, which is correct — the internal reference really is in
+rad/s and `as5047p.speed` is in rad/s too. The **read-back branch, however, returns
+`aim_speed` instead of `aim_speeed_rpm`**, so a `Get` returns your rpm divided by
+`speed_rpm_param` (`9.5238095`). A Set of 100 rpm reads back as `10.5`.
+
+Because the automatic refresh ran `get_targets()` every second and wrote that value
+straight into the spin box, the number in the box used to shrink on its own:
+`100 → 10.5 → 1.10 → 0.116 → … → 0`. Every further Set then commanded a smaller
+setpoint until the speed loop was left hunting around zero — the motor shook and could
+not turn.
+
+The GUI handles this in two ways:
+
+- `handle_target_response` scales the speed read-back by
+  `FIRMWARE_SPEED_READBACK_SCALE` so the box shows the rpm you sent. Position, Iq, Id,
+  Uq and Ud are stored unscaled by the firmware and are written back unchanged.
+- A spin box you have typed into is marked as edited, and the polling read-back skips it
+  until you press **Set** (for that entry or **Set All**) or **Get All**. Typing is never
+  overwritten while you are still entering a value.
+
+> **The firmware has been fixed.** `Nebula_st_mdk/FOC/AuroFOCCOMM.c`,
+> `motor_aim_speed_param()`, now ends its read branch with
+> `package.data1.f = motorA.aim.aim_speeed_rpm;`, so a `Get` returns rpm directly.
+> **`FIRMWARE_SPEED_READBACK_SCALE` is therefore `1.0`** — do not put the old
+> `9.5238095` back unless you are running an unpatched controller, or the displayed
+> speed will read 9.52× too high.
+>
+> `FOC/AuroFOCCOMM copy.c` still contains the old bug, but it is **not listed in
+> `MDK-ARM/Nebula_st_mdk.uvprojx`**, so Keil never compiles it. It is dead code.
+
+See also *Firmware fixes in `Nebula_st_mdk`* below for the other two controller-side
+bugs fixed in the same pass.
+
+Additional buttons in the same group:
+
+- **Set All** – sends all six values at once, in the order Iq, Id, Speed, Position, Uq/Ud.
+- **Get All** – reads back the six targets currently stored in the controller.
+- **Get Speed** – reads back the measured speed.
+- **Stop** – switches the motor to Stop mode. A Stop also cancels a target value that
+  is still waiting for its mode switch to settle, so nothing is sent after you stop.
+
+The last Speed and Position values you sent are remembered in `settings.json`
+(keys `speed_cmd` and `position_cmd`) and restored into the spin boxes on the next
+launch, so a repeated command needs no retyping.
+
+If the motor still shakes at a steady speed, work through the controller side first —
+see **Firmware fixes in `Nebula_st_mdk`** below. Both the speed read-back bug (which
+made the setpoint shrink towards zero, leaving the speed loop hunting) and the
+un-reset PID integrators (which carried a saturated integral across mode changes and
+Stop) are fixed there. Confirm the speed box still shows the value you typed after the
+auto-refresh has run a few times.
+
+If the setpoint is correct and the motor still oscillates, check the **PID Tuning** tab
+next: the Speed-loop gains are not read from the controller on connect, so the spin
+boxes show `0.000000` until you set them, and a zero-gain speed loop will oscillate. The
+**Limits** tab behaves the same way — its boxes also start at `0` and are only sent when
+you press **Set Limits**. Note that the controller's own defaults are not zero
+(`speed_pid = 0.0985, 0.00185`, `max_speed = ±1000 rpm`); the zeros are only what the
+GUI displays before it has been told anything.
+
+### Firmware fixes in `Nebula_st_mdk`
+
+Three controller-side bugs behind the "motor shakes instead of turning" symptom were
+fixed in `FOC/AuroPID.c`, `FOC/AuroPID.h`, `FOC/AuroFOC.c` and `FOC/AuroFOCCOMM.c`.
+
+**1. Speed read-back returned the wrong variable** (`AuroFOCCOMM.c`,
+`motor_aim_speed_param`). The read branch returned `aim_speed` (internal rad/s) instead
+of `aim_speeed_rpm` (the rpm you sent), so a `Get` returned your value divided by
+`9.5238095`. Combined with the GUI's 1 s auto-refresh this made the setpoint ratchet
+towards zero — `100 → 10.5 → 1.10 → … → 0` — and the speed loop was left hunting.
+Now returns `aim_speeed_rpm`.
+
+**2. PID integrators were never reset** (`AuroPID.c`). `acc_integral` was only cleared
+by `PID_Init`, which `APP/MotorEvent.c` calls once at boot. Nothing reset it on a mode
+change, on Stop, or on a gain change, so a saturated integral was carried into the next
+loop. With the defaults (`speed_pid.I = 0.00185`, `I_integral_maxlimit = 400`) a
+saturated integrator alone commands `0.00185 × 400 ≈ 0.74 A` of Iq the instant a loop is
+entered. A new public helper was added:
+
+```c
+void PID_Reset_Integral( AuroPID *pid ){
+	pid->acc_integral = 0;
+	pid->last_error   = 0;
+	pid->error        = 0;
+}
+```
+
+It is called from `motor_work_mode_param` (all four loops, via the file-local
+`_foc_reset_all_integrals`), from `_foc_stop_loop`, and from all four PID parameter
+handlers, so a gain change no longer keeps an old integral scaled by the new `I`.
+
+**3. Position limits were never enforced** (`AuroFOCCOMM.c` +
+`FOC/AuroFOC.c`). `max_position` / `min_position` were stored and read back but used
+nowhere. `motor_aim_position_param` now clamps the incoming target with
+`_foc_value_limit`, and `_foc_position_loop` clamps again before the position PID.
+
+Also in `motor_work_mode_param` / `_foc_stop_loop`: entering position mode now clears
+`aim.aim_position` along with `as5047p.postion`, and Stop zeroes `aim_iq`, `aim_speed`
+and `aim_speeed_rpm`. Without that, entering position mode reset the *measured* position
+to 0 while leaving the old *target*, so the position PID saw the whole target angle as
+an error and the motor lurched.
+
+> **You must re-flash the board.** The firmware has no `Makefile` or `CMakeLists.txt` —
+> the only build path is the Keil MDK-5 project `MDK-ARM/Nebula_st_mdk.uvprojx`, so it
+> must be rebuilt on Windows. The sources pass a syntax check with an ARM-targeted
+> `clang -fsyntax-only` with zero errors and no new warnings, but that is not a real
+> build.
+
+> The `_foc_get_angle` offset/wrap handling was investigated as a fourth suspect and
+> **cleared**: over 3600 samples its output is exactly `(raw − mechanical_offset) mod 360`
+> with a maximum step of 0.01° per 0.01° of raw input. The apparent jump at raw ≈ 301.46
+> is a correct wrap through 0°. It was left untouched.
 
 ### 5. Tune parameters
 
@@ -307,24 +501,87 @@ Use the manual command tab to send raw hexadecimal commands and inspect received
 
 ### Window is taller than the screen
 
-The Motor Control and PID Tuning tabs are dense. When a tab does not fit
-vertically it is placed inside a scroll area, and the window is clamped to the
-available screen area on startup. Maximise the window, or scroll the affected
-tab.
+The Motor Control and PID Tuning tabs are dense. When a tab does not fit inside
+the window (too tall *or* too wide, which happens at high zoom levels) it is
+placed inside a scroll area, and the window is clamped to the available screen
+area on startup and after every zoom change. Maximise the window, lower the
+zoom, or scroll the affected tab.
 
-### IMU 3D model does not move
+### IMU 3D model does not move, or the cube keeps spinning
 
-The 3D model follows the gyroscope, but the gyro zero bias is measured on
-startup and it must be measured while the device is completely still.
+The 3D model follows the gyroscope, and the gyro zero bias is measured while
+polling starts. Three things keep the cube still when the board is not moving.
 
+- **The bias is learned from the median of the still samples, not from their
+  magnitude.** MEMS gyros commonly report a large constant offset at rest (the
+  reference log in this repo reads about `+14 / -35 / -0.5 dps` on a board that
+  is sitting perfectly flat), so the calibration cannot use "is the reading
+  large?" to decide whether the device is moving. It instead discards samples
+  that deviate from the running median by more than `calib_motion_dps`. Movement
+  therefore no longer prevents the bias from converging - the offset can be
+  arbitrarily large and still be measured correctly.
 - Press **Start Polling** and leave the device still for the first 2-5 seconds
-  (the status bar shows `Calibrating IMU... n/30`).
-- Samples taken while the device is moving are discarded, so calibration simply
-  takes longer instead of learning a wrong bias.
+  (the status bar shows `Calibrating IMU... n/30`). Before the bias is ready the
+  running median is subtracted from every sample, so the model does not spin up
+  during calibration either.
+- **Corrupt frames are filtered out.** A single bad gyro frame (the reference
+  log contains one that briefly reads `416 dps` on Z between neighbours of
+  `-0.5 dps`) would integrate into tens of degrees of phantom yaw, so the newest
+  five samples per axis are median-filtered. This removes bursts of up to two
+  bad frames with no effect on real rotation - sustained motion passes through
+  unchanged, delayed by two frames (40 ms).
 - Rotation is always applied to the model, even while calibration is still
   running, so the model responds from the first packet.
-- If the model drifts or does not move, stop polling and start it again with the
-  device at rest.
+- **Frames that no sensor can explain are discarded.** Some corrupt frames keep
+  a perfectly plausible accelerometer but carry an impossible gyro reading. The
+  reference log contains 14 such frames that all repeat the constant
+  `gy = 527.90 dps` (an I16 saturation value), and 16 frames whose raw rate
+  exceeds `300 dps` even though the accelerometer-derived tilt never leaves
+  +/-11 degrees. Because the blend is gated by `accel_gate_dps` and a corrupt
+  high-rate frame closes that gate by itself, the one frame that needs the
+  accelerometer correction is the one denied it - so a single frame could
+  integrate up to `56` degrees (the per-frame `dt` is clamped to `0.1 s`) and
+  the next few seconds slowly pulled it back. That is the "jolt, then return"
+  symptom. The filter now checks the kinematics instead: the change in the
+  accelerometer-derived gravity direction must agree with what the gyro
+  predicts (`residual = |d(g_hat)/dt - omega x g_hat|`). Measured separation is
+  wide - legitimate rotation stays below `91 dps` even at `400 dps`, while all
+  known corrupt frames exceed `450 dps`. Frames above `consist_tol_deg` (60)
+  skip the roll/pitch integration but still receive the accelerometer blend, so
+  the attitude is corrected immediately rather than integrated away.
+  `consist_min_dps` (40) suppresses the check at low rates, where dividing by
+  `dt` would amplify accelerometer noise into false positives.
+- **Frames whose accelerometer is implausible also skip integration.** If
+  `|a|` leaves `[accel_norm_min, accel_norm_max]` (`0.75`-`1.25 g`) the frame
+  cannot be cross-checked at all, yet its gyro is usually corrupt too, so the
+  attitude is frozen for that frame. Sustained bursts (verified up to 60
+  consecutive bad frames) no longer accumulate any drift. Yaw is never frozen,
+  because a pure yaw rotation does not change the gravity direction and so
+  cannot be validated.
+- Do **not** raise `accel_gate_dps` to hide these frames. A constant rotation
+  above the gate never blends in the accelerometer, and the attitude runs away
+  completely (verified: a `60 dps` rotation reads `103` degrees of error per
+  frame once the gate is raised to 80).
+
+With all of the above, the reference "jolt" log improves from `4.83` to `1.30`
+degrees mean tilt error, `25.83` to `4.55` at the 95th percentile, `62.05` to
+`14.45` worst case, and steady pitch wander from `59.66` to `16.79` degrees,
+with zero change on a clean log and identical tracking at 10-300 dps.
+
+If the model still drifts slowly with the board at rest, the gyro is picking up
+real noise above the `gyro_deadband_dps` floor (0.5 dps); raise that value in
+`gui_tabs/main_window.py`. If the model spins *fast* while the board is still,
+the reported zero-rate offset is larger than usual and the board's configured
+gyro full-scale range is worth checking against `GYRO_SCALE` (0.0305 dps/LSB
+assumes +/-1000 dps) - a mismatched range adds a scale error on top of the bias.
+
+The frames themselves are a link-layer problem: `comm_backend.py` scans for the
+`0xDE`/`0xED` head and tail bytes and `CommandPacket.parse()` validates the
+length and those two bytes only. There is **no checksum**, so a corrupted
+24-byte window that happens to start and end correctly is accepted silently.
+Adding a CRC to the protocol, or reducing the firmware's IMU send rate (the
+reference log shows `dt` jitter from 2 ms to 351 ms around a 90 ms mean), would
+remove the bad frames at the source instead of filtering them here.
 
 ### IMU axes do not match the physical board
 
@@ -332,7 +589,7 @@ startup and it must be measured while the device is completely still.
 straight through. If roll/pitch/yaw appear swapped or inverted, uncomment the
 alternative mapping block there and adjust the signs for your mounting.
 
-### Wrong theme or language after launch
+### Wrong theme, language or zoom after launch
 
 The last selection is remembered in `config/settings.json`. Delete that file to
-reset both back to the defaults (light theme, English).
+reset all three back to the defaults (light theme, English, 100 %).

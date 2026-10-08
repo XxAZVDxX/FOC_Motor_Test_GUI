@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTabWidget,
                              QScrollArea, QFrame, QGridLayout, QSplitter,
                              QListWidget)
 from PyQt5.QtCore import QTimer, Qt
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QFont, QKeySequence
 
 import i18n
 import settings
@@ -41,6 +41,20 @@ MODE_ITEMS = [
     (6, "Position loop"),
 ]
 
+MODE_STOP = 0
+MODE_OPEN_LOOP = 3
+MODE_CURRENT_LOOP = 4
+MODE_SPEED_LOOP = 5
+MODE_POSITION_LOOP = 6
+
+# 每种控制模式实际生效的目标值，用于在界面上标出当前起作用的那一项
+MODE_TARGET_KEYS = {
+    MODE_OPEN_LOOP: ("Uq:", "Ud:"),
+    MODE_CURRENT_LOOP: ("Iq:", "Id:"),
+    MODE_SPEED_LOOP: ("Speed (rpm):",),
+    MODE_POSITION_LOOP: ("Position (deg):",),
+}
+
 INTERFACE_ITEMS = [
     ("serial", "Serial (UART/RS485)"),
     ("can", "CAN"),
@@ -51,6 +65,16 @@ DEFAULT_CUBE = "Default Cube"
 # 串口列表自动刷新间隔（毫秒）与电机 ID 检测超时（毫秒）
 PORT_REFRESH_INTERVAL_MS = 1500
 DETECT_TIMEOUT_MS = 3000
+# 模式切换与目标值之间需要留出间隔：固件切换闭环要花时间（初始化电流环、
+# 复位速度环积分器、读取编码器），紧接着下发目标值会被当成上个模式的残留指令。
+MODE_SWITCH_SETTLE_MS = 120
+
+# 速度回读系数。固件 motor_aim_speed_param() 原本返回内部值 aim_speed（rpm/9.5238095），
+# 所以旧固件下 Get 回来的速度只有实际值的 1/9.5238095，需要乘 9.5238095 补回来。
+# Nebula_st_mdk 已在 motor_aim_speed_param() 里改为回读 aim_speeed_rpm（rpm），
+# 因此烧录新固件后这里必须是 1.0，否则界面显示的速度会大 9.5238095 倍。
+# 如果换回未修复的旧固件，把它改回 9.5238095 即可。
+FIRMWARE_SPEED_READBACK_SCALE = 1.0
 
 TAB_KEYS = ["Connection", "Motor Control", "PID Tuning", "Real-time Data",
             "Limits", "Manual", "IMU 3D"]
@@ -74,7 +98,7 @@ class ComplementaryFilter:
         self.pitch = 0.0
         self.yaw = 0.0
 
-    def update(self, gx, gy, gz, ax, ay, az):
+    def update(self, gx, gy, gz, ax, ay, az, accel_usable=True, gyro_trustworthy=True):
         # 加速度计计算的姿态（弧度）
         acc_roll = math.atan2(ay, az)
         acc_pitch = math.atan2(-ax, math.sqrt(ay*ay + az*az))
@@ -83,12 +107,24 @@ class ComplementaryFilter:
         delta_r = math.radians(gx) * self.dt
         delta_p = math.radians(gy) * self.dt
         delta_y = math.radians(gz) * self.dt
-        self.roll  += max(-cap, min(cap, delta_r))
-        self.pitch += max(-cap, min(cap, delta_p))
+        # gyro_trustworthy 为 False 表示该帧的角速度与加速度计互相矛盾（物理上
+        # 不可能同时成立），几乎可以肯定是串口坏帧，此时宁可整帧冻住姿态：
+        # 不积分等于本帧引入 0 误差，随后几帧的加速度计修正会把它拉回正确位置。
+        # 注意 yaw 不受此门限约束——纯偏航转动不会改变重力方向，无法用加速度计
+        # 校验，若一并冻结会把真实的偏航削掉。
+        if gyro_trustworthy:
+            self.roll  += max(-cap, min(cap, delta_r))
+            self.pitch += max(-cap, min(cap, delta_p))
         self.yaw   += max(-cap, min(cap, delta_y))
         # 互补滤波：转动时加速度计读数含离心力，若每帧都融合会把姿态拉回，
-        # 因此仅在角速度很低（接近静止）时才用它修正 roll/pitch
-        if math.hypot(gx, gy) < self.accel_gate_dps:
+        # 因此仅在角速度很低（接近静止）时才用它修正 roll/pitch。
+        # 这里按合矢量判断，避免某个轴单独偏大时门限被绕过。
+        # accel_usable 由调用方给出：合矢量偏离 1g 太多时该帧的 acc_roll/acc_pitch
+        # 没有意义（坏帧会算出 ±90° 的假姿态），必须禁止融合。
+        # 坏帧额外“强制打开”修正：坏帧的虚假角速度往往同时超过 accel_gate_dps，
+        # 若照常判断，最需要被修正的那一帧反而会被门限挡住。
+        if accel_usable and (not gyro_trustworthy
+                             or math.sqrt(gx*gx + gy*gy + gz*gz) < self.accel_gate_dps):
             self.roll  = self.alpha * self.roll  + (1 - self.alpha) * acc_roll
             self.pitch = self.alpha * self.pitch + (1 - self.alpha) * acc_pitch
         # yaw 依赖陀螺仪，加轻微衰减防止长时间漂移
@@ -122,6 +158,13 @@ class MainWindow(QMainWindow):
         if initial_settings is None:
             initial_settings = settings.load()
         self.current_theme = initial_settings["theme"]
+        # 视图缩放百分比：整份样式表的字体/间距都按它等比缩放
+        self.zoom = theme.clamp_zoom(initial_settings.get("zoom", theme.DEFAULT_ZOOM))
+        # 上次用过的速度/位置指令，跨会话保留，打开就能直接再发一次
+        self.last_speed_cmd = float(initial_settings.get("speed_cmd", 0.0) or 0.0)
+        self.last_position_cmd = float(initial_settings.get("position_cmd", 0.0) or 0.0)
+        # 用户手动敲过、还没点 Set 的速度/位置：轮询回读不许覆盖，否则输入会被改写
+        self.target_edited = {"Speed (rpm):": False, "Position (deg):": False}
         tr.set_language(initial_settings["language"])
 
         self.setWindowTitle(tr("Motor Control GUI"))
@@ -173,6 +216,13 @@ class MainWindow(QMainWindow):
         self.detect_timeout_timer.setInterval(DETECT_TIMEOUT_MS)
         self.detect_timeout_timer.timeout.connect(self.on_detect_timeout)
 
+        # 延迟下发目标值：先切模式，等固件就绪后再发目标值
+        self.pending_target_timer = QTimer()
+        self.pending_target_timer.setSingleShot(True)
+        self.pending_target_timer.setInterval(MODE_SWITCH_SETTLE_MS)
+        self.pending_target_timer.timeout.connect(self._flush_pending_target)
+        self.pending_target = None
+
         self.gear_ratio_num = 1.0
         self.gear_ratio_den = 1.0
         self.last_position_deg = 0.0
@@ -205,8 +255,37 @@ class MainWindow(QMainWindow):
         self.calib_samples = 0
         self.calib_max_samples = 100          # 100 个样本，约 2-5 秒
         self.calib_min_samples = 30           # 至少累计这么多静止样本才收敛
-        self.calib_motion_dps = 8.0           # 超过该角速度视为在动，丢弃该样本
+        # 零偏大小没有上限（有些模块静态偏移就有几十 dps），因此不能用绝对阈值
+        # 判断“是否在动”，改为看样本是否偏离已采集样本的中位数。
+        self.calib_motion_dps = 8.0           # 偏离中位数的容忍量，超过则丢弃该样本
         self.calib_buffer = []
+        self.gyro_deadband_dps = 0.5          # 校准后残余的微小读数直接归零，避免长期漂移
+        # 偶发的读数尖峰（实测 gz 会瞬间跳到 416 dps，前后帧却只有 -0.4 dps），
+        # 积分后会带来几度到几十度的虚假偏航。用 5 点中值滤波消除尖峰：
+        # 要污染中位数需要连续 3 帧坏数据，而真实转动是连续的多帧信号，
+        # 只会被延迟 2 帧（40ms），肉眼不可见。
+        self.gyro_history = []
+        self.gyro_outlier_dps = 50.0          # 中值与原值差异超过该值即判定为尖峰
+        # 加速度计合矢量必须接近 1g 才可信。实测静止帧为 0.977~1.071g，而坏帧
+        # 会落到 0.09g 或 3.2g，由此算出的 acc_roll/acc_pitch 是 ±90° 之类的假姿态；
+        # 若让它们进入互补滤波，姿态会被瞬间拉偏再慢慢爬回来，即肉眼看 到的“抖动”。
+        self.accel_norm_min = 0.75
+        self.accel_norm_max = 1.25
+
+        # 仅凭合矢量还不够：有些坏帧的加速度计数值仍在 0.75~1.25g 内，但陀螺仪
+        # 读数被线路干扰成几百 dps。这种帧积分一次就能推走十几到几十度（实测单帧
+        # 最大 56°，因为 dt 上限 0.1s），随后几秒才慢慢爬回来，即“抖一下又回正”。
+        # 因此再做一次运动学一致性校验：陀螺仪预测的重力方向变化必须与加速度计
+        # 实测的变化相符。两者互相矛盾时该帧角速度不可信，冻结 roll/pitch 积分。
+        # 实测合法转动（400 dps 以内）残差不超过 ~91 dps，而全部 8 个已知坏帧都
+        # 在 450 dps 以上，留有约 5 倍余量。
+        self.consist_tol_deg = 60.0           # 残差超过该值判为该帧不一致
+        self.consist_min_dps = 40.0           # 角速度太小时残差被噪声放大，不做判断
+        self.consist_nbad = 1                 # 连续多少帧不一致才判定为坏帧
+        self.freeze_bad_accel = True          # 加速度计失真的帧是否一并冻结角速度积分
+        self.imu_prev_unit = None             # 上一帧归一化后的重力方向
+        self.imu_prev_good = False            # 上一帧加速度计是否可用
+        self.imu_bad_streak = 0               # 连续不一致帧数
 
         self.config_manager = ConfigManager("./config")
 
@@ -252,24 +331,36 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel(tr("Not connected"))
         self.statusBar().addWidget(self.status_label)
 
+        # 缩放控件固定在状态栏右侧，配合 View 菜单的快捷键一起使用
+        self.zoom_label = self._bind_text(QLabel(), "Zoom:")
+        self.zoom_combo = QComboBox()
+        for level in theme.ZOOM_LEVELS:
+            self.zoom_combo.addItem("%d%%" % level, level)
+        self.zoom_combo.setCurrentIndex(self.zoom_combo.findData(self.zoom))
+        self.zoom_combo.activated.connect(
+            lambda _index: self.set_zoom(self.zoom_combo.currentData()))
+        self.statusBar().addPermanentWidget(self.zoom_label)
+        self.statusBar().addPermanentWidget(self.zoom_combo)
+
         self.apply_theme(self.current_theme)
         # 首次评估轮询门控：连接页的串口列表自动刷新也随之启动
         self._apply_polling_gates()
 
     # ---------- 菜单栏 ----------
     def _wrap_scrollable(self, widget, force=False):
-        """把过高的标签页放进滚动区域，保证小屏幕下也能访问全部控件。
+        """把过大的标签页放进滚动区域，保证小屏幕/高缩放下也能访问全部控件。
 
         force=True 用于已知必然超高的标签页（其高度依赖运行时字体度量，
-        不适合在布局前判断）。
+        不适合在布局前判断）。缩放到很大时宽度也会超过屏幕，同样需要滚动。
         """
-        if not force and widget.minimumSizeHint().height() <= 700:
+        hint = widget.minimumSizeHint()
+        if not force and hint.height() <= 700 and hint.width() <= 700:
             return widget
         scroll = QScrollArea()
         scroll.setWidget(widget)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.viewport().setAutoFillBackground(False)
         return scroll
 
@@ -301,6 +392,28 @@ class MainWindow(QMainWindow):
             self.theme_group.addAction(action)
             theme_menu.addAction(action)
             self._text_bindings.append((action, name, "setText"))
+
+        view_menu.addSeparator()
+
+        # 缩放：快捷键在 macOS 上由 Qt 自动映射为 Command +/-/0
+        zoom_in_action = QAction(tr("Zoom In"), self)
+        zoom_in_action.setShortcuts([QKeySequence("Ctrl++"), QKeySequence("Ctrl+=")])
+        zoom_in_action.triggered.connect(self.zoom_in)
+        view_menu.addAction(zoom_in_action)
+
+        zoom_out_action = QAction(tr("Zoom Out"), self)
+        zoom_out_action.setShortcuts([QKeySequence("Ctrl+-"), QKeySequence("Ctrl+_")])
+        zoom_out_action.triggered.connect(self.zoom_out)
+        view_menu.addAction(zoom_out_action)
+
+        zoom_reset_action = QAction(tr("Reset Zoom"), self)
+        zoom_reset_action.setShortcut(QKeySequence("Ctrl+0"))
+        zoom_reset_action.triggered.connect(self.reset_zoom)
+        view_menu.addAction(zoom_reset_action)
+
+        self._text_bindings.append((zoom_in_action, "Zoom In", "setText"))
+        self._text_bindings.append((zoom_out_action, "Zoom Out", "setText"))
+        self._text_bindings.append((zoom_reset_action, "Reset Zoom", "setText"))
 
         view_menu.addSeparator()
 
@@ -358,8 +471,10 @@ class MainWindow(QMainWindow):
     # ---------- 主题 / 语言切换 ----------
     def apply_theme(self, theme_name):
         app = QApplication.instance()
-        self.colors = theme.apply_theme(app, theme_name)
+        self.colors = theme.apply_theme(app, theme_name, self.zoom)
         theme.apply_plot_theme(self.plot_widget, theme_name)
+        theme.apply_plot_zoom(self.plot_widget, self.zoom)
+        self._apply_zoom_to_widgets()
         self.motor_preview.set_colors(self.colors)
         self.imu_3d_view.setBackgroundColor(self.colors["gl_bg"])
         self.imu_3d_view.update()
@@ -383,6 +498,43 @@ class MainWindow(QMainWindow):
         self.apply_theme(theme_name)
         self._persist_settings()
 
+    # ---------- 视图缩放 ----------
+    def set_zoom(self, percent):
+        """按百分比等比缩放整个界面（样式表 + pyqtgraph + 少量硬编码尺寸）。"""
+        new_zoom = theme.clamp_zoom(percent)
+        if new_zoom == self.zoom:
+            return
+        self.zoom = new_zoom
+        self.apply_theme(self.current_theme)
+        if self.zoom_combo.currentData() != new_zoom:
+            self.zoom_combo.setCurrentIndex(self.zoom_combo.findData(new_zoom))
+        # 缩放后最小尺寸会变化，等布局完成后重新把窗口收回屏幕内
+        QTimer.singleShot(0, self._clamp_to_screen)
+        self._persist_settings()
+
+    def zoom_in(self):
+        self.set_zoom(self.zoom + theme.ZOOM_STEP)
+
+    def zoom_out(self):
+        self.set_zoom(self.zoom - theme.ZOOM_STEP)
+
+    def reset_zoom(self):
+        self.set_zoom(theme.DEFAULT_ZOOM)
+
+    def _apply_zoom_to_widgets(self):
+        """缩放样式表管不到的硬编码尺寸（表盘、3D 视图、绘图控件等）。"""
+        factor = self.zoom / 100.0
+        preview_side = int(round(340 * factor))
+        self.motor_preview.setMinimumSize(int(round(200 * factor)), int(round(200 * factor)))
+        self.motor_preview.setMaximumSize(preview_side, preview_side)
+        self.imu_3d_view.setMinimumSize(int(round(360 * factor)), int(round(320 * factor)))
+        self.model_combo.setMinimumWidth(int(round(160 * factor)))
+        self.plot_widget.setMinimumHeight(int(round(260 * factor)))
+        self.serial_port_list.setMinimumHeight(int(round(72 * factor)))
+        self.serial_port_list.setMaximumHeight(int(round(96 * factor)))
+        for spin, _btn in self.target_set_btns.values():
+            spin.setMinimumWidth(int(round(110 * factor)))
+
     def set_language(self, language_code):
         if not tr.set_language(language_code):
             return
@@ -390,7 +542,14 @@ class MainWindow(QMainWindow):
         self._persist_settings()
 
     def _persist_settings(self):
-        settings.save({"theme": self.current_theme, "language": tr.language})
+        # 与已有设置合并，避免只写入部分键时丢掉其它偏好
+        values = settings.load()
+        values["theme"] = self.current_theme
+        values["language"] = tr.language
+        values["zoom"] = self.zoom
+        values["speed_cmd"] = self.last_speed_cmd
+        values["position_cmd"] = self.last_position_cmd
+        settings.save(values)
 
     def retranslate_ui(self):
         """语言切换后重新设置所有界面文本（不重建控件）。"""
@@ -408,6 +567,13 @@ class MainWindow(QMainWindow):
                 self._fill_combo(combo, entries)
                 if combo is self.mode_combo:
                     self.handle_mode_response(combo.currentData())
+        # 缩放下拉框的条目是百分比数字，_fill_combo 会清空它，需要重新填充
+        self.zoom_combo.blockSignals(True)
+        self.zoom_combo.clear()
+        for level in theme.ZOOM_LEVELS:
+            self.zoom_combo.addItem("%d%%" % level, level)
+        self.zoom_combo.setCurrentIndex(self.zoom_combo.findData(self.zoom))
+        self.zoom_combo.blockSignals(False)
         self.plot_widget.setLabel('left', tr("Value"))
         self.plot_widget.setLabel('bottom', tr("Time (samples)"))
         self.refresh_interval_spin.setSuffix(tr(" ms"))
@@ -420,56 +586,92 @@ class MainWindow(QMainWindow):
         cube_idx = self.model_combo.findData(DEFAULT_CUBE)
         if cube_idx >= 0:
             self.model_combo.setItemText(cube_idx, tr(DEFAULT_CUBE))
+        self.update_active_target_highlight()
 
     # ---------- 创建标签页的函数 ----------
     def create_connection_tab(self):
         widget = QWidget()
-        layout = QFormLayout(widget)
+        layout = QVBoxLayout(widget)
         layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+        layout.setSpacing(8)
 
+        # 接口选择放在最上面，串口/CAN 分组框随之整体切换
+        top_bar = QHBoxLayout()
+        top_bar.setSpacing(6)
+        top_bar.addWidget(self._label("Interface:"))
         self.interface_combo = QComboBox()
         self._fill_combo(self.interface_combo, INTERFACE_ITEMS, keep=False)
+        top_bar.addWidget(self.interface_combo)
+        top_bar.addStretch(1)
+        layout.addLayout(top_bar)
+
+        # ── 串口分组：端口列表 + 刷新按钮同一行标题栏，列表本身压到最低高度 ──
+        self.serial_group = QGroupBox(tr("Serial (UART/RS485)"))
+        self._text_bindings.append((self.serial_group, "Serial (UART/RS485)", "setTitle"))
+        serial_grid = QGridLayout(self.serial_group)
+        serial_grid.setContentsMargins(8, 8, 8, 8)
+        serial_grid.setHorizontalSpacing(8)
+        serial_grid.setVerticalSpacing(6)
+
         # 串口用列表而不是下拉框：新出现的端口插入到列表顶部，方便一眼看到
         self.serial_port_list = QListWidget()
-        self.serial_port_list.setMinimumHeight(96)
-        self.serial_port_list.setMaximumHeight(140)
+        self.serial_port_list.setMinimumHeight(72)
+        self.serial_port_list.setMaximumHeight(96)
         self.serial_port_list.setSelectionMode(QListWidget.SingleSelection)
         self.auto_refresh_ports_cb = self._bind_text(QCheckBox(), "Auto-refresh ports")
         self.auto_refresh_ports_cb.setChecked(True)
         self.refresh_ports_btn = self._bind_text(QPushButton(), "Refresh")
         self.baudrate_combo = QComboBox()
         self.baudrate_combo.addItems(["9600","19200","38400","57600","115200","2000000"])
+
+        port_bar = QHBoxLayout()
+        port_bar.setSpacing(6)
+        port_bar.addWidget(self._label("Serial Port:"))
+        port_bar.addStretch(1)
+        port_bar.addWidget(self.auto_refresh_ports_cb)
+        port_bar.addWidget(self.refresh_ports_btn)
+        serial_grid.addLayout(port_bar, 0, 0, 1, 2)
+        serial_grid.addWidget(self.serial_port_list, 1, 0, 1, 2)
+        serial_grid.addWidget(self._label("Baudrate:"), 2, 0)
+        serial_grid.addWidget(self.baudrate_combo, 2, 1)
+        serial_grid.setColumnStretch(1, 1)
+        layout.addWidget(self.serial_group)
+
+        # ── CAN 分组 ─────────────────────────────────────────────────
+        self.can_group = QGroupBox(tr("CAN"))
+        self._text_bindings.append((self.can_group, "CAN", "setTitle"))
+        can_grid = QGridLayout(self.can_group)
+        can_grid.setContentsMargins(8, 8, 8, 8)
+        can_grid.setHorizontalSpacing(8)
+        can_grid.setVerticalSpacing(6)
+
         self.can_channel_edit = QLineEdit("PCAN_USBBUS1")
         self.can_bustype_combo = QComboBox()
         self.can_bustype_combo.addItems(["pcan","socketcan","kvaser","ixxat","vector"])
         self.can_bitrate_edit = QLineEdit("500000")
+        can_grid.addWidget(self._label("CAN Channel:"), 0, 0)
+        can_grid.addWidget(self.can_channel_edit, 0, 1)
+        can_grid.addWidget(self._label("CAN Bustype:"), 1, 0)
+        can_grid.addWidget(self.can_bustype_combo, 1, 1)
+        can_grid.addWidget(self._label("CAN Bitrate:"), 2, 0)
+        can_grid.addWidget(self.can_bitrate_edit, 2, 1)
+        can_grid.setColumnStretch(1, 1)
+        layout.addWidget(self.can_group)
+
+        # ── 连接操作与检测结果显示 ───────────────────────────────────
+        action_bar = QHBoxLayout()
+        action_bar.setSpacing(6)
         self.connect_btn = self._bind_text(QPushButton(), "Connect")
         self.detect_btn = self._bind_text(QPushButton(), "Detect Motor ID")
         self.detect_btn.setEnabled(False)
         self.motor_id_label = self._label("None")
-
-        layout.addRow(self._label("Interface:"), self.interface_combo)
-        port_layout = QVBoxLayout()
-        port_layout.setSpacing(4)
-        port_row = QHBoxLayout()
-        port_row.setSpacing(6)
-        port_row.addWidget(self.serial_port_list, 1)
-        port_btns = QVBoxLayout()
-        port_btns.setSpacing(4)
-        port_btns.addWidget(self.refresh_ports_btn)
-        port_btns.addWidget(self.auto_refresh_ports_cb)
-        port_btns.addStretch(1)
-        port_row.addLayout(port_btns)
-        port_layout.addLayout(port_row)
-        layout.addRow(self._label("Serial Port:"), port_layout)
-        layout.addRow(self._label("Baudrate:"), self.baudrate_combo)
-        layout.addRow(self._label("CAN Channel:"), self.can_channel_edit)
-        layout.addRow(self._label("CAN Bustype:"), self.can_bustype_combo)
-        layout.addRow(self._label("CAN Bitrate:"), self.can_bitrate_edit)
-        layout.addRow(self.connect_btn)
-        layout.addRow(self.detect_btn)
-        layout.addRow(self._label("Detected Motor ID:"), self.motor_id_label)
+        action_bar.addWidget(self.connect_btn)
+        action_bar.addWidget(self.detect_btn)
+        action_bar.addStretch(1)
+        action_bar.addWidget(self._label("Detected Motor ID:"))
+        action_bar.addWidget(self.motor_id_label)
+        layout.addLayout(action_bar)
+        layout.addStretch(1)
 
         self.interface_combo.currentIndexChanged.connect(self.update_interface_visibility)
         self.refresh_ports_btn.clicked.connect(self.refresh_serial_ports)
@@ -581,33 +783,65 @@ class MainWindow(QMainWindow):
         target_layout.setVerticalSpacing(4)
         self.target_iq = QDoubleSpinBox(); self.target_iq.setRange(-10,10); self.target_iq.setDecimals(3)
         self.target_id = QDoubleSpinBox(); self.target_id.setRange(-10,10); self.target_id.setDecimals(3)
-        self.target_speed = QDoubleSpinBox(); self.target_speed.setRange(-5000,5000)
-        self.target_position = QDoubleSpinBox(); self.target_position.setRange(-5000,5000)
+        # 速度和位置要能直接敲入指令值，所以放宽上限并保留三位小数
+        self.target_speed = QDoubleSpinBox()
+        self.target_speed.setRange(-settings.CMD_LIMIT, settings.CMD_LIMIT)
+        self.target_speed.setDecimals(3)
+        self.target_speed.setSingleStep(10)
+        self.target_position = QDoubleSpinBox()
+        self.target_position.setRange(-settings.CMD_LIMIT, settings.CMD_LIMIT)
+        self.target_position.setDecimals(3)
+        self.target_position.setSingleStep(1)
         self.target_uq = QDoubleSpinBox(); self.target_uq.setRange(-6,6)
         self.target_ud = QDoubleSpinBox(); self.target_ud.setRange(-6,6)
-        set_target_btn = self._bind_text(QPushButton(), "Set All")
-        get_target_btn = self._bind_text(QPushButton(), "Get All")
-        self.get_speed_btn = self._bind_text(QPushButton(), "Get Speed")
-        # (label key, widget) 成对排列成两列，把 6 行压缩为 3 行
+        # 每项后面各带一个 Set 按钮：只发这一项，不再连带其它目标值
+        self.target_set_btns = {}
+        self.target_labels = {}
         targets = (("Iq:", self.target_iq), ("Id:", self.target_id),
                    ("Speed (rpm):", self.target_speed),
                    ("Position (deg):", self.target_position),
                    ("Uq:", self.target_uq), ("Ud:", self.target_ud))
         for idx, (key, spin) in enumerate(targets):
             row, col = divmod(idx, 2)
-            target_layout.addWidget(self._label(key), row, col * 2)
-            target_layout.addWidget(spin, row, col * 2 + 1)
+            base = col * 3
+            label = self._label(key)
+            spin.setMinimumWidth(int(round(110 * self.zoom / 100.0)))
+            set_btn = self._bind_text(QPushButton(), "Set")
+            set_btn.clicked.connect(lambda _=False, k=key: self.set_target_value(k))
+            target_layout.addWidget(label, row, base)
+            target_layout.addWidget(spin, row, base + 1)
+            target_layout.addWidget(set_btn, row, base + 2)
+            self.target_labels[key] = label
+            self.target_set_btns[key] = (spin, set_btn)
+        # 提示：单项 Set 的行为，以及速度/位置会自动切换工作模式
+        self.target_hint = self._label(
+            "Each Set button sends only that value; Speed/Position also switch the mode")
+        target_layout.addWidget(self.target_hint, 3, 0, 1, 6)
         btn_hlay = QHBoxLayout()
         btn_hlay.setSpacing(6)
+        set_target_btn = self._bind_text(QPushButton(), "Set All")
+        get_target_btn = self._bind_text(QPushButton(), "Get All")
+        self.get_speed_btn = self._bind_text(QPushButton(), "Get Speed")
+        self.stop_motor_btn = self._bind_text(QPushButton(), "Stop")
         btn_hlay.addWidget(set_target_btn)
         btn_hlay.addWidget(get_target_btn)
         btn_hlay.addWidget(self.get_speed_btn)
-        target_layout.addLayout(btn_hlay, 3, 0, 1, 4)
+        btn_hlay.addWidget(self.stop_motor_btn)
+        target_layout.addLayout(btn_hlay, 4, 0, 1, 6)
         target_group.setLayout(target_layout)
         grid.addWidget(target_group, 2, 1)
         set_target_btn.clicked.connect(self.set_targets)
         get_target_btn.clicked.connect(self.get_targets)
         self.get_speed_btn.clicked.connect(self.get_motor_speed)
+        self.stop_motor_btn.clicked.connect(self.stop_motor)
+        # 恢复上次用过的速度/位置指令
+        self.target_speed.setValue(self.last_speed_cmd)
+        self.target_position.setValue(self.last_position_cmd)
+        # 用户手动改值就标记为“已编辑”，轮询回读不再覆盖；点 Set/Get 时清除
+        self.target_speed.valueChanged.connect(
+            lambda _=0.0: self._mark_target_edited("Speed (rpm):"))
+        self.target_position.valueChanged.connect(
+            lambda _=0.0: self._mark_target_edited("Position (deg):"))
 
         current_group = QGroupBox(tr("Phase Currents"))
         self._text_bindings.append((current_group, "Phase Currents", "setTitle"))
@@ -985,6 +1219,9 @@ class MainWindow(QMainWindow):
     # ---------- 通信和数据处理 ----------
     def update_interface_visibility(self):
         is_serial = self.interface_combo.currentData() == "serial"
+        # 只显示当前接口的分组框，避免另一组控件白占高度
+        self.serial_group.setVisible(is_serial)
+        self.can_group.setVisible(not is_serial)
         self.serial_port_list.setEnabled(is_serial)
         self.refresh_ports_btn.setEnabled(is_serial)
         self.auto_refresh_ports_cb.setEnabled(is_serial)
@@ -1084,6 +1321,8 @@ class MainWindow(QMainWindow):
         self.stop_auto_refresh()
         self.detect_timeout_timer.stop()
         self.detect_pending = False
+        self.pending_target_timer.stop()
+        self.pending_target = None
         if self.comm_backend:
             try:
                 self.comm_backend.packet_received.disconnect(self.on_packet_received)
@@ -1267,6 +1506,23 @@ class MainWindow(QMainWindow):
         idx = self.mode_combo.findData(mode)
         if idx >= 0:
             self.mode_combo.setCurrentIndex(idx)
+        self.update_active_target_highlight()
+
+    def update_active_target_highlight(self):
+        """把当前工作模式下真正生效的目标值加粗，其余保持常规字重。"""
+        active = MODE_TARGET_KEYS.get(self.mode_combo.currentData(), ())
+        font = self.target_hint.font()
+        for key, label in self.target_labels.items():
+            bold = key in active
+            if label.font().bold() != bold:
+                new_font = QFont(font)
+                new_font.setBold(bold)
+                label.setFont(new_font)
+            spin, set_btn = self.target_set_btns[key]
+            tip = tr("Active target for the current mode") if bold else tr(
+                "Not used by the current mode")
+            spin.setToolTip(tip)
+            set_btn.setToolTip(tip)
 
     def get_motor_parameters(self):
         mid = self.get_current_motor_id()
@@ -1283,12 +1539,97 @@ class MainWindow(QMainWindow):
     def set_targets(self):
         mid = self.get_current_motor_id()
         if mid == 0:
+            QMessageBox.warning(self, tr("Warning"), tr("No motor ID"))
             return
         self.send_command(0x20,0x01, data1=self.target_iq.value(), motor_id=mid)
         self.send_command(0x21,0x01, data1=self.target_id.value(), motor_id=mid)
         self.send_command(0x22,0x01, data1=self.target_speed.value(), motor_id=mid)
         self.send_command(0x23,0x01, data1=self.target_position.value(), motor_id=mid)
         self.send_command(0x24,0x01, data1=self.target_uq.value(), data2=self.target_ud.value(), motor_id=mid)
+        self._clear_target_edited("Speed (rpm):")
+        self._clear_target_edited("Position (deg):")
+
+    def _target_command(self, key):
+        """返回某个目标值的 (功能码, 取值函数, 需要的数据字个数)。"""
+        if key == "Iq:":
+            return 0x20, lambda: self.target_iq.value(), 1
+        if key == "Id:":
+            return 0x21, lambda: self.target_id.value(), 1
+        if key == "Speed (rpm):":
+            return 0x22, lambda: self.target_speed.value(), 1
+        if key == "Position (deg):":
+            return 0x23, lambda: self.target_position.value(), 1
+        if key == "Uq:":
+            return 0x24, lambda: self.target_uq.value(), 2
+        if key == "Ud:":
+            # Ud 与 Uq 共用 0x24，两个数据字必须一起发
+            return 0x24, lambda: self.target_ud.value(), 2
+        return None, None, 0
+
+    def set_target_value(self, key):
+        """只发送一个目标值；速度和位置会顺带把工作模式切到对应闭环。"""
+        func2, getter, words = self._target_command(key)
+        if func2 is None:
+            return
+        mid = self.get_current_motor_id()
+        if mid == 0:
+            QMessageBox.warning(self, tr("Warning"), tr("No motor ID"))
+            return
+        if key == "Speed (rpm):":
+            self.last_speed_cmd = self.target_speed.value()
+            self._persist_settings()
+            self._clear_target_edited(key)
+        elif key == "Position (deg):":
+            self.last_position_cmd = self.target_position.value()
+            self._persist_settings()
+            self._clear_target_edited(key)
+        target_mode = {"Speed (rpm):": MODE_SPEED_LOOP,
+                       "Position (deg):": MODE_POSITION_LOOP}.get(key)
+        # 需要先切模式时，目标值必须等模式生效后再发（见 _switch_mode_for_target）
+        if target_mode is not None and self.mode_combo.currentData() != target_mode:
+            self.pending_target = (func2, getter, words, mid)
+            self._switch_mode_for_target(target_mode, mid)
+            return
+        self._send_target(func2, getter, words, mid)
+
+    def _send_target(self, func2, getter, words, mid):
+        """真正把目标值写下去；words == 2 表示 Uq/Ud 共用一个功能码。"""
+        if words == 2:
+            self.send_command(func2, 0x01, data1=self.target_uq.value(),
+                              data2=self.target_ud.value(), motor_id=mid)
+        else:
+            self.send_command(func2, 0x01, data1=getter(), motor_id=mid)
+
+    def _flush_pending_target(self):
+        """模式切换的等待时间到了，补发之前挂起的目标值。"""
+        pending, self.pending_target = self.pending_target, None
+        if pending is None or not self.comm_backend:
+            return
+        func2, getter, words, mid = pending
+        # 期间用户可能换了电机，按当时的电机号发送
+        self._send_target(func2, getter, words, self.get_current_motor_id() or mid)
+
+    def _switch_mode_for_target(self, mode, mid):
+        """把电机切到指定闭环模式；模式设置与目标值之间保持间隔。
+
+        模式指令和速度/位置指令挨着发出去时，固件往往还在执行模式切换，
+        新目标值会被当作切换过程中的扰动，表现为电机左右抖动。
+        调用方需先确认当前模式与 mode 不同，并且已设置好 pending_target。
+        """
+        self.send_command(0x01, 0x01, data1=mode, motor_id=mid)
+        self.handle_mode_response(mode)
+        if self.pending_target is not None:
+            self.pending_target_timer.start()
+
+    def stop_motor(self):
+        mid = self.get_current_motor_id()
+        if mid == 0:
+            QMessageBox.warning(self, tr("Warning"), tr("No motor ID"))
+            return
+        self.pending_target_timer.stop()
+        self.pending_target = None
+        self.send_command(0x01, 0x01, data1=MODE_STOP, motor_id=mid)
+        self.handle_mode_response(MODE_STOP)
 
     def get_targets(self):
         mid = self.get_current_motor_id()
@@ -1299,6 +1640,9 @@ class MainWindow(QMainWindow):
         self.send_command(0x22,0x00, motor_id=mid)
         self.send_command(0x23,0x00, motor_id=mid)
         self.send_command(0x24,0x00, motor_id=mid)
+        # 显式刷新：以固件状态为准，清掉“已编辑”标记，回读才允许改写输入框
+        self._clear_target_edited("Speed (rpm):")
+        self._clear_target_edited("Position (deg):")
 
     def get_motor_speed(self):
         mid = self.get_current_motor_id()
@@ -1313,12 +1657,35 @@ class MainWindow(QMainWindow):
         elif name == "Id":
             self.target_id.setValue(packet.data1.as_float())
         elif name == "Speed":
-            self.target_speed.setValue(packet.data1.as_float())
+            self._apply_target_readback("Speed (rpm):", self.target_speed, packet.data1.as_float())
         elif name == "Position":
-            self.target_position.setValue(packet.data1.as_float())
+            self._apply_target_readback("Position (deg):", self.target_position, packet.data1.as_float())
         elif name == "UqUd":
             self.target_uq.setValue(packet.data1.as_float())
             self.target_ud.setValue(packet.data2.as_float())
+
+    def _mark_target_edited(self, key):
+        """用户在速度/位置框里改过值。标记后回读不再覆盖，直到点了 Set/Get。"""
+        self.target_edited[key] = True
+
+    def _clear_target_edited(self, key):
+        self.target_edited[key] = False
+
+    def _apply_target_readback(self, key, spin, raw_value):
+        """把固件回读的目标值写回输入框。
+
+        速度要乘 FIRMWARE_SPEED_READBACK_SCALE，因为固件回读返回的是内部单位
+        （rad/s），不是用户下发的 rpm。位置没有缩放，原样写回。
+        用户正在编辑（已改未发）时不覆盖，否则打字打到一半会被轮询改写。
+        """
+        if self.target_edited.get(key):
+            return
+        value = raw_value
+        if key == "Speed (rpm):":
+            value = raw_value * FIRMWARE_SPEED_READBACK_SCALE
+        spin.blockSignals(True)
+        spin.setValue(value)
+        spin.blockSignals(False)
 
     def set_pid(self, name):
         mid = self.get_current_motor_id()
@@ -1722,7 +2089,7 @@ class MainWindow(QMainWindow):
         self.gz_raw = gz_raw
 
         # 量程系数：根据实际 LSM6DS3TR 配置 ±1000dps，加速度 ±4g
-        # 若板端配置不同，请修改以下系数
+        # 若板端配置不同，请修改以下系数（量程偏大/偏小会让静止读数偏离 0）
         GYRO_SCALE = 0.0305   # 1000 dps / 32768
         ACC_SCALE = 0.000122  # 4g / 32768
 
@@ -1757,36 +2124,63 @@ class MainWindow(QMainWindow):
         self.label_gy.setText(f"gy: {gy:.1f} dps")
         self.label_gz.setText(f"gz: {gz:.1f} dps")
 
-        # 自动零偏校准：只在设备静止时采样，避免把转动当成零偏
-        if self.calibrating_gyro:
+        # 先做中值滤波，保证零偏不被尖峰污染，也不会把尖峰积分成虚假偏航
+        gx_gui, gy_gui, gz_gui = self._filter_gyro_median(gx_gui, gy_gui, gz_gui)
+
+        # 加速度计合矢量校验：坏帧（az 被读成 0、或数值异常）算出的 acc_roll /
+        # acc_pitch 毫无意义，必须整帧跳过互补滤波，否则姿态会被瞬间拉偏再慢慢
+        # 爬回原位，看起来就是“抖一下又回正”。
+        accel_norm = math.sqrt(ax_gui * ax_gui + ay_gui * ay_gui + az_gui * az_gui)
+        accel_usable = accel_norm > 0 and (
+            self.accel_norm_min <= accel_norm <= self.accel_norm_max)
+        if accel_norm > 0 and not accel_usable:
+            print("[IMU] Bad accel frame skipped: |a| = {:.3f} g".format(accel_norm))
+            self.status_label.setText(tr("IMU bad accel frame skipped"))
+        # 自动零偏校准：零偏本身可能很大（实测静态偏移可达 ~37 dps），所以不能
+        # 用“角速度绝对值”判断设备是否在动，否则静止样本会被全部丢弃、零偏退化为 0。
+        # 改为判断样本是否偏离已采集样本的中位数：静止读数彼此接近，转动读数会明显偏离。
+        # 零偏取中位数而非均值，偶发的读数尖峰（日志中确实存在）不会污染结果。
+        # 坏帧既不参与校准，也不阻止校准收敛（否则坏帧会让校准永远差几个样本）。
+        if self.calibrating_gyro and accel_usable:
             self.calib_samples += 1
-            if math.hypot(gx_gui, gy_gui, gz_gui) < self.calib_motion_dps:
-                self.calib_buffer.append((gx_gui, gy_gui, gz_gui))
-            enough_samples = len(self.calib_buffer) >= self.calib_min_samples
-            if enough_samples or self.calib_samples >= self.calib_max_samples:
-                n = len(self.calib_buffer)
-                if n:
-                    avg_x = sum(v[0] for v in self.calib_buffer) / n
-                    avg_y = sum(v[1] for v in self.calib_buffer) / n
-                    avg_z = sum(v[2] for v in self.calib_buffer) / n
-                else:
-                    avg_x = avg_y = avg_z = 0.0
-                self.gyro_bias = [avg_x, avg_y, avg_z]
+            sample = (gx_gui, gy_gui, gz_gui)
+            moving = False
+            if self.calib_buffer:
+                med = self._median_axes(self.calib_buffer)
+                deviation = math.sqrt(sum((sample[i] - med[i]) ** 2 for i in range(3)))
+                moving = deviation >= self.calib_motion_dps
+            if not moving:
+                self.calib_buffer.append(sample)
+            if (len(self.calib_buffer) >= self.calib_min_samples
+                    or self.calib_samples >= self.calib_max_samples):
+                # 收尾时优先用采到的静止样本；一个都没采到就退回当前读数
+                self.gyro_bias = self._median_axes(self.calib_buffer or [sample])
                 self.calibrating_gyro = False
-                print(f"[IMU] Calibration done. Bias: {avg_x:.2f}, {avg_y:.2f}, {avg_z:.2f} dps")
+                print("[IMU] Calibration done. Bias: {:.2f}, {:.2f}, {:.2f} dps".format(
+                    self.gyro_bias[0], self.gyro_bias[1], self.gyro_bias[2]))
                 self.status_label.setText(
                     tr("IMU ready (bias: {}, {}, {})").format(
-                        round(avg_x, 1), round(avg_y, 1), round(avg_z, 1)))
+                        round(self.gyro_bias[0], 1), round(self.gyro_bias[1], 1),
+                        round(self.gyro_bias[2], 1)))
                 self.calib_buffer.clear()
             else:
                 self.status_label.setText(
                     tr("Calibrating IMU... {}/{}").format(
                         len(self.calib_buffer), self.calib_min_samples))
 
-        # 减去零偏
-        gx_cal = gx_gui - self.gyro_bias[0]
-        gy_cal = gy_gui - self.gyro_bias[1]
-        gz_cal = gz_gui - self.gyro_bias[2]
+        # 校准期间用已采样本的中位数即时扣除：避免在拿到零偏之前把静态偏移
+        # 积分成虚假偏航（校准结束后 gyro_bias 本身就是这个中位数，数值连续）。
+        # 还没采到样本时直接以当前读数为零偏，第一帧起就不会虚假转动。
+        if self.calibrating_gyro:
+            bias = self._median_axes(self.calib_buffer) if self.calib_buffer \
+                else [gx_gui, gy_gui, gz_gui]
+        else:
+            bias = self.gyro_bias
+
+        # 减去零偏，并消掉残余的微小读数
+        gx_cal = self._apply_gyro_deadband(gx_gui - bias[0])
+        gy_cal = self._apply_gyro_deadband(gy_gui - bias[1])
+        gz_cal = self._apply_gyro_deadband(gz_gui - bias[2])
 
         current_time = time.time()
         dt = current_time - self.last_imu_time
@@ -1794,12 +2188,58 @@ class MainWindow(QMainWindow):
         dt = max(0.001, min(0.1, dt))
         self.last_imu_time = current_time
 
+        # 运动学一致性校验：陀螺仪预测的重力方向变化 vs 加速度计实测变化。
+        # 只有本帧和上一帧的加速度计都可信、且角速度足够大时才判断——静止时
+        # d(ĝ)/dt 与 ω×ĝ 都接近 0，残差完全被噪声支配，判断没有意义
+        # （实测静止噪声到 0.05g 都不会误触发，因为前置了 consist_min_dps）。
+        gyro_trustworthy = True
+        if (not self.calibrating_gyro) and accel_usable and self.imu_prev_good \
+                and self.imu_prev_unit is not None:
+            g_cal = (gx_cal, gy_cal, gz_cal)
+            if math.sqrt(g_cal[0]**2 + g_cal[1]**2 + g_cal[2]**2) >= self.consist_min_dps:
+                cur_unit = (ax_gui / accel_norm, ay_gui / accel_norm, az_gui / accel_norm)
+                gp = self.imu_prev_unit
+                dg = [(cur_unit[i] - gp[i]) / dt for i in range(3)]
+                # ω 用校准后的角速度（弧度/秒），单位与 dg 一致
+                omega = [math.radians(v) for v in g_cal]
+                gpx, gpy, gpz = gp
+                cross = (omega[1] * gpz - omega[2] * gpy,
+                         omega[2] * gpx - omega[0] * gpz,
+                         omega[0] * gpy - omega[1] * gpx)
+                # 传感器坐标轴与推导姿态的符号约定未完全确定，两种符号都试、取更接近的，
+                # 否则正常转动会被误判为坏帧
+                d1 = math.sqrt(sum((dg[i] - cross[i]) ** 2 for i in range(3)))
+                d2 = math.sqrt(sum((dg[i] + cross[i]) ** 2 for i in range(3)))
+                residual_deg = math.degrees(min(d1, d2))
+                if residual_deg > self.consist_tol_deg:
+                    self.imu_bad_streak += 1
+                    if self.imu_bad_streak >= self.consist_nbad:
+                        gyro_trustworthy = False
+                        print("[IMU] Inconsistent gyro frame skipped: "
+                              "residual = {:.0f} dps, |g| = {:.0f} dps".format(
+                                  residual_deg,
+                                  math.sqrt(g_cal[0]**2 + g_cal[1]**2 + g_cal[2]**2)))
+                        self.status_label.setText(tr("IMU inconsistent gyro frame skipped"))
+                else:
+                    self.imu_bad_streak = 0
+        # 加速度计不可用的帧同样不能积分：这类帧的角速度往往一起被干扰成几百 dps，
+        # 却又无法做一致性校验（没有可信的重力方向），只能保守冻结。
+        if (not self.calibrating_gyro) and not accel_usable and self.freeze_bad_accel:
+            gyro_trustworthy = False
+        # 记录本帧状态供下一帧比较
+        if accel_usable and accel_norm > 1e-9:
+            self.imu_prev_unit = (ax_gui / accel_norm, ay_gui / accel_norm, az_gui / accel_norm)
+            self.imu_prev_good = True
+        else:
+            self.imu_prev_good = False
+
         # 校准期间也持续积分，3D 模型从第一帧起就能跟随转动
         if self.filter is None:
             self.filter = ComplementaryFilter(dt=0.02, alpha=0.92)
 
         self.filter.dt = dt
-        q = self.filter.update(gx_cal, gy_cal, gz_cal, ax_gui, ay_gui, az_gui)
+        q = self.filter.update(gx_cal, gy_cal, gz_cal, ax_gui, ay_gui, az_gui,
+                               accel_usable, gyro_trustworthy)
 
         roll_deg = math.degrees(self.filter.roll)
         pitch_deg = math.degrees(self.filter.pitch)
@@ -1817,6 +2257,39 @@ class MainWindow(QMainWindow):
 
         if self.logging_cb.isChecked():
             self.log_imu_data(ax, ay, az, gx, gy, gz, roll_deg, pitch_deg, yaw_deg)
+
+    def _filter_gyro_median(self, gx, gy, gz):
+        # 5 点中值滤波：逐轴取最近五帧的中位数。连续 2 帧以内的尖峰会被完全
+        # 消除，连续的真实转动不受影响（稳态下中值即原值，仅延迟 2 帧）。
+        self.gyro_history.append((gx, gy, gz))
+        if len(self.gyro_history) > 5:
+            del self.gyro_history[0]
+        if len(self.gyro_history) < 5:
+            return gx, gy, gz
+        out = []
+        for i in range(3):
+            col = sorted(s[i] for s in self.gyro_history)
+            out.append(col[2])
+        if max(abs(out[i] - (gx, gy, gz)[i]) for i in range(3)) >= self.gyro_outlier_dps:
+            print("[IMU] Outlier frame filtered: raw ({:.1f}, {:.1f}, {:.1f}) dps".format(gx, gy, gz))
+            self.status_label.setText(tr("IMU outlier frame discarded"))
+        return out[0], out[1], out[2]
+
+    @staticmethod
+    def _median_axes(samples):
+        # 每个轴单独取中位数：对偶发的读数尖峰不敏感
+        n = len(samples)
+        med = []
+        for i in range(3):
+            col = sorted(s[i] for s in samples)
+            med.append(col[n // 2] if n % 2 else 0.5 * (col[n // 2 - 1] + col[n // 2]))
+        return med
+
+    def _apply_gyro_deadband(self, value):
+        # 零偏校准后的残差通常只有零点几 dps，直接积分会缓慢累积成漂移
+        if abs(value) < self.gyro_deadband_dps:
+            return 0.0
+        return value
 
     def update_imu_debug_text(self):
         if not hasattr(self, 'imu_debug_text'):
@@ -1855,6 +2328,7 @@ class MainWindow(QMainWindow):
 
     def clear_imu_log(self):
         self.imu_log_text.clear()
+        self._imu_log_header_written = False
 
     def save_imu_log_to_csv(self):
         filename, _ = QFileDialog.getSaveFileName(self, tr("Save IMU Log"), "", tr("CSV Files (*.csv)"))
@@ -1868,6 +2342,11 @@ class MainWindow(QMainWindow):
 
     def log_imu_data(self, ax, ay, az, gx, gy, gz, roll, pitch, yaw):
         timestamp = time.strftime("%H:%M:%S") + f".{int(time.time()*1000)%1000:03d}"
+        if not getattr(self, '_imu_log_header_written', False):
+            self.imu_log_text.appendPlainText(
+                "timestamp, ax(g), ay(g), az(g), gx(dps), gy(dps), gz(dps), "
+                "roll(deg), pitch(deg), yaw(deg)")
+            self._imu_log_header_written = True
         log_line = (f"{timestamp}, {ax:.3f}, {ay:.3f}, {az:.3f}, "
                     f"{gx:.1f}, {gy:.1f}, {gz:.1f}, "
                     f"{roll:.1f}, {pitch:.1f}, {yaw:.1f}")
@@ -1881,7 +2360,12 @@ class MainWindow(QMainWindow):
             self.calibrating_gyro = True
             self.calib_samples = 0
             self.calib_buffer = []
+            self.gyro_history = []
             self.gyro_bias = [0.0, 0.0, 0.0]
+            # 一致性校验的跨帧状态必须清空，否则会拿上一次运行的旧方向做比较
+            self.imu_prev_unit = None
+            self.imu_prev_good = False
+            self.imu_bad_streak = 0
             # 姿态从零开始，但保留 filter 实例，使模型在校准期间即可跟随转动
             self.filter = ComplementaryFilter(dt=0.02, alpha=0.92)
             self.last_imu_time = time.time()
