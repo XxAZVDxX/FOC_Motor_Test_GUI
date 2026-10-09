@@ -788,6 +788,35 @@ class MainWindow(QMainWindow):
         grid.addWidget(param_group, 2, 0)
         get_params_btn.clicked.connect(self.get_motor_parameters)
 
+        # 手动写入极对数/零偏/方向。
+        # 自动校准偶尔会算错（比如机械行程绕圈），以前算错就只能改固件重新编译烧录，
+        # 现在可以直接在这里填正确值下发，固件会立刻存进 Flash，掉电也不丢。
+        set_param_group = QGroupBox(tr("Set Motor Parameters"))
+        self._text_bindings.append((set_param_group, "Set Motor Parameters", "setTitle"))
+        set_param_layout = QFormLayout()
+        set_param_layout.setSpacing(6)
+        self.set_pole_pair_spin = QSpinBox()
+        self.set_pole_pair_spin.setRange(1, 64)
+        self.set_pole_pair_spin.setValue(7)
+        self.set_offset_spin = QDoubleSpinBox()
+        self.set_offset_spin.setRange(0.0, 359.999)
+        self.set_offset_spin.setDecimals(3)
+        self.set_offset_spin.setValue(0.0)
+        self.set_dir_combo = QComboBox()
+        self._fill_combo(self.set_dir_combo, [(1, "Enable"), (0, "Disable")], keep=False)
+        set_param_layout.addRow(self._label("Pole Pairs:"), self.set_pole_pair_spin)
+        set_param_layout.addRow(self._label("Zero Offset (°):"), self.set_offset_spin)
+        set_param_layout.addRow(self._label("Encoder Direction:"), self.set_dir_combo)
+        set_param_btn = self._bind_text(QPushButton(), "Set")
+        set_param_layout.addRow(set_param_btn)
+
+        clear_cal_btn = self._bind_text(QPushButton(), "Clear Calibration")
+        set_param_layout.addRow(clear_cal_btn)
+        set_param_group.setLayout(set_param_layout)
+        grid.addWidget(set_param_group, 3, 0)
+        set_param_btn.clicked.connect(self.set_motor_parameters)
+        clear_cal_btn.clicked.connect(self.clear_calibration)
+
         target_group = QGroupBox(tr("Target Values"))
         self._text_bindings.append((target_group, "Target Values", "setTitle"))
         target_layout = QGridLayout()
@@ -843,7 +872,7 @@ class MainWindow(QMainWindow):
         target_group.setLayout(target_layout)
         grid.addWidget(target_group, 2, 1)
         set_target_btn.clicked.connect(self.set_targets)
-        get_target_btn.clicked.connect(self.get_targets)
+        get_target_btn.clicked.connect(lambda: self.get_targets(user_initiated=True))
         self.get_speed_btn.clicked.connect(self.get_motor_speed)
         self.stop_motor_btn.clicked.connect(self.stop_motor)
         # 恢复上次用过的速度/位置指令
@@ -1543,10 +1572,60 @@ class MainWindow(QMainWindow):
         self.send_command(0x02, 0x00, motor_id=mid)
 
     def handle_pole_pair_response(self, packet):
-        if packet.func3 == 0x00:
-            self.pole_pair_label.setText(str(packet.data1.as_uint32()))
-            self.offset_label.setText(f"{packet.data2.as_float():.3f}°")
-            self.encoder_dir_label.setText(str(packet.data3.as_uint32()))
+        # func3=0x00 是读取应答，0x01 是写入后的回读应答，两种都要刷新界面
+        if packet.func3 in (0x00, 0x01):
+            pole_pair = packet.data1.as_uint32()
+            offset = packet.data2.as_float()
+            direction = packet.data3.as_uint32()
+            self.pole_pair_label.setText(str(pole_pair))
+            self.offset_label.setText(f"{offset:.3f}°")
+            self.encoder_dir_label.setText(str(direction))
+            # 顺手填进写入框，用户想改哪一项就在哪一项上改，不用重复输入
+            self.set_pole_pair_spin.setValue(max(1, min(64, int(pole_pair))))
+            self.set_offset_spin.setValue(max(0.0, min(359.999, offset)))
+            self._fill_combo(self.set_dir_combo, [(1, "Enable"), (0, "Disable")], keep=False)
+            idx = self.set_dir_combo.findData(1 if direction else 0)
+            if idx >= 0:
+                self.set_dir_combo.setCurrentIndex(idx)
+
+    def set_motor_parameters(self):
+        """手动写入极对数/零点偏移/编码器方向，写入 0x02 且 func3=0x01。
+
+        固件收到后立刻写 Flash（掉电保留），所以按一次就够，不需要重复烧录。
+        """
+        mid = self.get_current_motor_id()
+        if mid == 0:
+            QMessageBox.warning(self, tr("Warning"), tr("No motor ID selected"))
+            return
+        pole_pair = int(self.set_pole_pair_spin.value())
+        offset = float(self.set_offset_spin.value())
+        direction = int(self.set_dir_combo.currentData() or 0)
+        self.send_command(0x02, 0x01, pole_pair, offset, direction, motor_id=mid)
+        self.status_label.setText(
+            f"{tr('Set Motor Parameters')}: PP={pole_pair}, "
+            f"Offset={offset:.3f}°, Dir={direction}")
+
+    def clear_calibration(self):
+        """清掉 Flash 里保存的校准记录，恢复固件自带的默认参数。
+
+        校准把人搞糊涂的时候（比如装机后读数明显不合理）用这个回到出厂状态，
+        然后重新走一遍 Calibration 模式即可。
+        """
+        mid = self.get_current_motor_id()
+        if mid == 0:
+            QMessageBox.warning(self, tr("Warning"), tr("No motor ID selected"))
+            return
+        # 0x02 / func3=0x02：擦掉校准页，改回编译期默认值（7 / 1 / 301.464°）
+        self.send_command(0x02, 0x02, motor_id=mid)
+        self.pole_pair_label.setText("7")
+        self.offset_label.setText("301.464°")
+        self.encoder_dir_label.setText("1")
+        self.set_pole_pair_spin.setValue(7)
+        self.set_offset_spin.setValue(301.464)
+        idx = self.set_dir_combo.findData(1)
+        if idx >= 0:
+            self.set_dir_combo.setCurrentIndex(idx)
+        self.status_label.setText(tr("Clear Calibration"))
 
     def set_targets(self):
         mid = self.get_current_motor_id()
@@ -1650,7 +1729,13 @@ class MainWindow(QMainWindow):
         self.send_command(0x01, 0x01, data1=MODE_STOP, motor_id=mid)
         self.handle_mode_response(MODE_STOP)
 
-    def get_targets(self):
+    def get_targets(self, user_initiated=False):
+        """读回目标值。
+
+        user_initiated 只有点“Get All”按钮时才为 True。自动轮询每秒也会调这里，
+        那时绝不能清“已编辑”标记——否则用户刚填的值会在 1 秒内被回读覆盖掉，
+        表现就是“要填好几次才能设置成功”。
+        """
         mid = self.get_current_motor_id()
         if mid == 0:
             return
@@ -1659,9 +1744,10 @@ class MainWindow(QMainWindow):
         self.send_command(0x22,0x00, motor_id=mid)
         self.send_command(0x23,0x00, motor_id=mid)
         self.send_command(0x24,0x00, motor_id=mid)
-        # 显式刷新：以固件状态为准，清掉“已编辑”标记，回读才允许改写输入框
-        self._clear_target_edited("Speed (rpm):")
-        self._clear_target_edited("Position (deg):")
+        if user_initiated:
+            # 显式刷新：以固件状态为准，清掉“已编辑”标记，回读才允许改写输入框
+            self._clear_target_edited("Speed (rpm):")
+            self._clear_target_edited("Position (deg):")
 
     def get_motor_speed(self):
         mid = self.get_current_motor_id()
@@ -1729,6 +1815,9 @@ class MainWindow(QMainWindow):
         if key == "Speed (rpm):":
             self._detect_speed_scale(raw_value)
         if self.target_edited.get(key):
+            return
+        # 光标还在框里说明正在输入，这时候回写会把用户敲一半的值顶掉
+        if spin.hasFocus() and spin.text() != "":
             return
         value = raw_value
         if key == "Speed (rpm):":

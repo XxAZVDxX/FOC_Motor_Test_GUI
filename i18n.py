@@ -94,6 +94,9 @@ _ZH_CN = {
     "Zero Offset (°):": "零点偏移 (°)：",
     "Encoder Direction:": "编码器方向：",
     "Get Parameters": "读取参数",
+    "Set Motor Parameters": "写入电机参数",
+    "Disable": "禁用",
+    "Clear Calibration": "清除校准记录",
 
     # ── targets ───────────────────────────────────────────────────
     "Target Values": "目标值",
@@ -335,6 +338,9 @@ _ZH_TW = {
     "Zero Offset (°):": "零點偏移 (°)：",
     "Encoder Direction:": "編碼器方向：",
     "Get Parameters": "讀取參數",
+    "Set Motor Parameters": "寫入馬達參數",
+    "Disable": "停用",
+    "Clear Calibration": "清除校準記錄",
 
     # ── targets ───────────────────────────────────────────────────
     "Target Values": "目標值",

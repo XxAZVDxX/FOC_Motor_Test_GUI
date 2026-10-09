@@ -118,15 +118,21 @@ These tabs were re-laid out so that controls that used to be stacked
 vertically now sit side by side, which cuts each tab's minimum width and leaves
 far less empty space on a wide screen.
 
-- **Motor Control** — eight group boxes in a two-column grid. Config spans the
-  full width on top; **Operating Mode** / **Motor Parameters** sit in the left
-  column and **Motor Selection** / **Target Values** in the right; **Phase
-  Currents** / **Auto Refresh** share the next row. The six *Target Values*
+- **Motor Control** — nine group boxes in a two-column grid. Config spans the
+  full width on top; **Operating Mode** / **Motor Parameters** /
+  **Set Motor Parameters** sit in the left column and **Motor Selection** /
+  **Target Values** in the right; **Phase Currents** / **Auto Refresh** share the
+  next row. The six *Target Values*
   entries each occupy a `label | spin box | Set` triplet, paired two per row, so
   every value can be sent on its own without touching the other five. The speed
   read-back is scaled by a factor the GUI detects automatically at runtime (rpm
   on the patched firmware — see *Firmware speed read-back scaling*) and never
-  overwrites a value you are still typing. The motor
+  overwrites a value you are still typing. **Set Motor Parameters** writes the
+  pole pair, zero offset and encoder direction back to the controller, which
+  stores them in flash; it is the manual override for a bad auto-calibration,
+  and **Get Parameters** pre-fills its three inputs. **Clear Calibration**
+  erases the stored record and restores the `7 / ENABLE / 301.464°` compile-time
+  defaults, which is the way back if a calibration left the board unusable. The motor
   preview spans the bottom with its readings in a two-column grid underneath the
   dial.
 - **PID Tuning** — the four PID groups form a 2×2 grid instead of a tall column.
@@ -501,29 +507,161 @@ violently but will not turn". `num = 0;` is now the first statement after the la
 echoed request word (always `0`), so the Motor Parameters panel's *Encoder Direction* read
 `0` no matter how the board was calibrated. It now returns `motorA.motor_rotate_direct`.
 
+**6. The pole-pair calibration arithmetic was wrong** (`FOC/AuroFOC.c`,
+`_foc_calibration_angle_pole_pair_mode`). This is the reason **only Calibration mode turned
+smoothly** and every other mode shook or stood still.
+
+The routine drives the current vector through `360 × 6 = 2160` electrical degrees and then
+estimates the pole-pair count from a *single* encoder sample:
+
+```c
+/* old, wrong */
+if( fabsf( calibration_end - calibration_start ) < 200 )
+    calibration_Pole_Pair = (360 * 6) / fabsf( calibration_end - calibration_start );
+else
+    calibration_Pole_Pair = (360 * 6) / (360 - fabsf( calibration_end - calibration_start ));
+```
+
+`calibration_start` and `calibration_end` are absolute encoder readings in `[0, 360)`, so
+their difference is **wrapped**: it can only describe a mechanical travel below ~200°. That
+holds only for `2160 / PP < 200`, i.e. **`PP ≥ ~11`**. Below that the measured difference is
+an alias of the true travel and the result is wrong by an integer factor — or is a division
+by zero. Measured against a synthetic rotor for `PP = 2…25`:
+
+| `PP` true | 2 | 3 | 4 | 5 | 6 | **7** | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 20 | 21 | 25 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| old formula | ∞ | ∞ | 12 | 30 | ∞ | **42** | 24 | 18 | 15 | 13.2 | 12 | 11.1 | 14 | 20 | ∞ | 25? |
+| new formula | 2 | 3 | 4 | 5 | 6 | **7** | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 20 | 21 | 25 |
+
+The old formula is wrong for **13 of 24** values. For the default motor it returned `42`
+where the truth is `7` — **6× too large**.
+
+Why that produces exactly the reported symptom: in every mode except calibration,
+`_foc_cal_sincos` computes the electrical angle as `as5047p.angle * Pole_Pair`. With
+`Pole_Pair = 42` the electrical angle advances 6× too fast, so the current vector is never
+near the rotor flux axis, the average torque is ~zero and only the torque ripple remains —
+the motor **buzzes and shakes but never turns**, and at some setpoints it cannot start at
+all. **Calibration mode is immune** because it overrides both inputs: it forces
+`foc->Pole_Pair = 1` and drives `as5047p.angle` from its own ramp, never calling
+`_foc_get_angle`. That is precisely why it was the one smooth mode.
+
+The fix accumulates the **unwrapped** encoder travel tick by tick during the ramp and then
+
+```c
+float travel_per_elec = travel / (CALIBRATION_ELEC_TURNS * 360.0f);
+if( travel_per_elec > 0.0001f )
+    calibration_Pole_Pair = (uint16_t)( 1.0f / travel_per_elec + 0.5f );
+```
+
+`PP = electrical_travel / mechanical_travel`, exact for every pole-pair count and free of
+the divide-by-zero. Verified exact for `PP = 2…25`.
+
+**7. Calibration results are now persisted to flash** (`APP/MotorEvent.c`). The three
+commissioning values are written to the last flash page (`0x0801F800`, page 63) as a
+24-byte record with a magic word and a checksum, and reloaded on boot. `APP/User_APP.c`
+services the write in the **1 ms** `HAL_TIM_PeriodElapsedCallback` rather than the 40 kHz
+ADC ISR, because erasing a flash page takes tens of milliseconds. The board has no DBANK
+option byte set, so the single-bank 128 KB layout makes page 63 valid.
+
+**8. `motor_pole_pair_param` gained a write branch** (`AuroFOCCOMM.c`). `0x02` with
+`func3 = 0x01` now sets `Pole_Pair` (clamped to `[1, 64]`), `mechanical_offset`
+(clamped to `[0, 360)`) and `motor_rotate_direct`, arms the flash save, and echoes the
+values actually applied. The **Set Motor Parameters** group in the Motor Control tab uses
+this: if auto-calibration ever mis-measures, the correct pole pair, zero offset and
+encoder direction can be written from the GUI without rebuilding the firmware. Every
+**Get Parameters** pre-fills those boxes.
+
+**9. Mode 1 (Self-test) now sets its own `Uq`/`Ud`** (`AuroFOC.c`, `_foc_selftest_loop`).
+It previously inherited whatever the previous mode had left in `foc->Uq`/`foc->Ud`, so the
+self-test either did nothing or ran at an arbitrary amplitude. It now forces
+`Uq = 1.5, Ud = 0`. The self-test still synthesises its angle and does not read the
+encoder — that is by design, it is a power-stage test, not a motion test.
+
+**10. `motor_pole_pair_param` gained a clear branch** (`AuroFOCCOMM.c`). `0x02` with
+`func3 = 0x02` erases the stored calibration record and resets `Pole_Pair`,
+`mechanical_offset` and `motor_rotate_direct` to the compile-time defaults. The **Clear
+Calibration** button uses it, so a calibration that produced a nonsensical pole pair can
+be undone from the GUI instead of needing another full re-calibration.
+
+**11. `sin()`/`cos()` were double-precision inside the 20 kHz ISR** (`FOC/AuroFOC.c`,
+`_foc_cal_sincos`). This was the remaining "little fast shake" in Speed-loop and
+Position-loop mode. The STM32G4 toolchain here targets a **single-precision** FPU
+(`fpu: sp`, `-mfpu=fpv4-sp-d16`), so `sin()` and `cos()` — which take and return
+`double` — compile to the software double-precision library. Two of those calls per
+50 µs ADC interrupt cost hundreds to thousands of cycles each and overran the ISR
+budget, so samples were dropped and the torque command jittered.
+
+Why only those two modes: pure Current-loop has no outer loop and just fits the 50 µs
+budget. Speed-loop adds one PID, Position-loop adds two. The overflow is marginal, which
+is exactly why the symptom was a small high-frequency tremble rather than a failure.
+
+The `while( e_angle > 360.0f ) e_angle -= 360.0f` wrap was a second problem: it is an
+unbounded loop on a variable. At `Pole_Pair = 14` the maximum is `360×14 + 360`, i.e. up
+to 14 iterations.
+
+Both were replaced by a single-precision 5th-order polynomial, folded into `[0°, 90°]`,
+and `fmodf()` for the wrap:
+
+```c
+static inline float _foc_sin_poly( float deg ){
+	float x = deg;
+	float sign = 1.0f;
+	if( x >= 360.0f ) x -= 360.0f;
+	if( x >= 180.0f ){ x -= 180.0f; sign = -1.0f; }
+	if( x >= 90.0f )  x = 180.0f - x;
+	x *= 0.017453292f;
+	{
+		float x2 = x * x;
+		return sign * x * ( 1.0f - x2 * ( 0.16666667f - x2 * ( 0.008333333f - x2 * 0.0001984127f )));
+	}
+}
+```
+
+`cosVal = _foc_sin_poly( e_angle + 90.0f )` reuses the same helper; the fold handles it
+because the input range is designed as `[0, 450)`. Swept over 0…360° in 0.01° steps the
+worst error is **0.000157** against the true `sin`/`cos` — two orders of magnitude inside
+the 0.2 % budget, and it is a handful of single-precision multiply-adds.
+
+**A lookup table was considered and rejected.** It would have to live in flash page 63
+(`0x0801F800`) — the same page as the calibration record — and fine-grained flash reads
+contend for, and can stall, the AHB bus at 20 kHz. A smaller table with linear
+interpolation was also rejected because a 260-iteration loop in an unoptimised Debug
+build cannot run 20 kHz inside a 50 µs ISR.
+
+**12. Calibration results persist across power cycles** (`APP/MotorEvent.c`). See item 7
+— the record is written to flash page 63, so the values in item 11's screenshot survive a
+reboot.
+
 **Cleared by the same audit — do not change these.** The complete
 Clarke → Park → iPark → SVPWM → duty chain was re-implemented in Python and swept over a
 full 360° with `Uq = 1.0, Ud = 0`: the reconstructed αβ vector matches the commanded vector
 at **every** angle, worst-case angle error `0.0000°`, amplitude ratio exactly `1.0`. The
 apparent sign asymmetry between `_foc_park` and `_foc_ipark` is not a bug.
 
-**Open issue: the calibration result is never saved.** `motorA.Pole_Pair`,
-`motorA.motor_rotate_direct` and `motorA.mechanical_offset` are written in exactly two
-places — the hard-coded defaults in `APP/MotorEvent.c` (`7`, `1`, `301.464`) and the
-runtime self-commissioning routine `_foc_calibration_angle_pole_pair_mode` (mode 2).
-There is no flash, EEPROM or backup-register write anywhere in the project, and
-`motor_pole_pair_param` has no write branch, so the controller cannot accept a
-calibrated offset back over the wire either. **Every power cycle therefore reverts the
-board to `7 / ENABLE / 301.464°`.** Those are demo values for a different motor; if they
-do not match the hardware, the current vector is commutated at the wrong rotor angle and
-the motor buzzes instead of turning. To keep a calibration, run mode 2, read the three
-values back with **Get Parameters**, and paste them into `APP/MotorEvent.c`.
+### 5. Calibrate the board (do this once after flashing)
 
-### 5. Tune parameters
+Flash the firmware, open the Motor Control tab, and switch the mode to **Calibration**.
+The board turns the rotor through six electrical revolutions in each direction and then
+writes the measured pole pair, zero offset and encoder direction to flash automatically.
+Open-loop, current, speed and position modes will then commutate correctly — provided the
+proper bus voltage and current limits are set. Confirm with **Get Parameters**; all three
+readings must be plausible (a pole pair in the single digits or low tens, an offset inside
+`[0, 360)`). If a reading looks wrong, type the correct value into **Set Motor
+Parameters** and press **Set** — it is saved immediately and survives a power cycle. If
+even that does not help, press **Clear Calibration** to erase the stored record and go back
+to the `7 / ENABLE / 301.464°` defaults, then calibrate once more.
+
+> **Note for the Keil flash settings.** In *Options for Target → Utilities → Settings*
+> use **Erase Sectors** (not *Erase Full Chip*) so that re-flashing the firmware does not
+> wipe the calibration page. *Erase Full Chip* erases everything and the board will fall
+> back to the `7 / ENABLE / 301.464°` defaults until you calibrate again. If the board
+> still behaves oddly after a *Download*, that is why.
+
+### 6. Tune parameters
 
 Use the PID tuning tab to adjust controller parameters.
 
-### 6. Monitor data
+### 7. Monitor data
 
 Use the real-time data and IMU tabs to observe:
 
@@ -532,7 +670,7 @@ Use the real-time data and IMU tabs to observe:
 - Position
 - IMU orientation
 
-### 7. Send manual commands
+### 8. Send manual commands
 
 Use the manual command tab to send raw hexadecimal commands and inspect received data.
 
