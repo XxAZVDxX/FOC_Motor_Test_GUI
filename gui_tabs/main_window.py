@@ -69,12 +69,16 @@ DETECT_TIMEOUT_MS = 3000
 # 复位速度环积分器、读取编码器），紧接着下发目标值会被当成上个模式的残留指令。
 MODE_SWITCH_SETTLE_MS = 120
 
-# 速度回读系数。固件 motor_aim_speed_param() 原本返回内部值 aim_speed（rpm/9.5238095），
-# 所以旧固件下 Get 回来的速度只有实际值的 1/9.5238095，需要乘 9.5238095 补回来。
-# Nebula_st_mdk 已在 motor_aim_speed_param() 里改为回读 aim_speeed_rpm（rpm），
-# 因此烧录新固件后这里必须是 1.0，否则界面显示的速度会大 9.5238095 倍。
-# 如果换回未修复的旧固件，把它改回 9.5238095 即可。
-FIRMWARE_SPEED_READBACK_SCALE = 1.0
+# 速度回读系数的默认值。
+# 修复前的固件 motor_aim_speed_param() 回读的是内部值 aim_speed（rpm/9.5238095），
+# 所以 Get 回来的速度只有实际值的 1/9.5238095，需要乘 9.5238095 补回来。
+# Nebula_st_mdk 已改成回读 aim_speeed_rpm（就是 rpm），新固件下这个系数应该是 1.0。
+# 两种固件都可能遇到，所以这里只当默认值用，实际值由 _detect_speed_scale()
+# 拿“刚下发过的速度”和回读值对比后自动校准，不必手工改。
+FIRMWARE_SPEED_READBACK_SCALE = 9.5238095
+# 新旧固件下回读值/下发值的比值（近似）
+_FW_RATIO_OLD = 1.0 / FIRMWARE_SPEED_READBACK_SCALE
+_FW_RATIO_NEW = 1.0
 
 TAB_KEYS = ["Connection", "Motor Control", "PID Tuning", "Real-time Data",
             "Limits", "Manual", "IMU 3D"]
@@ -163,8 +167,16 @@ class MainWindow(QMainWindow):
         # 上次用过的速度/位置指令，跨会话保留，打开就能直接再发一次
         self.last_speed_cmd = float(initial_settings.get("speed_cmd", 0.0) or 0.0)
         self.last_position_cmd = float(initial_settings.get("position_cmd", 0.0) or 0.0)
-        # 用户手动敲过、还没点 Set 的速度/位置：轮询回读不许覆盖，否则输入会被改写
+        # 速度/位置输入框当前是否“由用户掌管”。
+        # 只要用户敲过值、或者刚点过 Set 发过指令，这里就是 True，
+        # 轮询回读一律不许改写输入框——否则下一次 Set 发的就不是用户想要的值。
+        # 只有显式点 Get All 时才清成 False，允许回读把固件里的值填进来。
         self.target_edited = {"Speed (rpm):": False, "Position (deg):": False}
+        # 上一次真正下发过的速度/位置，用来判断回读值的单位是否合理
+        self.last_sent_speed = None
+        self.last_sent_position = None
+        # 当前判断出的固件速度回读系数，由 _detect_speed_scale() 自动校准
+        self.firmware_speed_scale = FIRMWARE_SPEED_READBACK_SCALE
         tr.set_language(initial_settings["language"])
 
         self.setWindowTitle(tr("Motor Control GUI"))
@@ -1546,8 +1558,12 @@ class MainWindow(QMainWindow):
         self.send_command(0x22,0x01, data1=self.target_speed.value(), motor_id=mid)
         self.send_command(0x23,0x01, data1=self.target_position.value(), motor_id=mid)
         self.send_command(0x24,0x01, data1=self.target_uq.value(), data2=self.target_ud.value(), motor_id=mid)
-        self._clear_target_edited("Speed (rpm):")
-        self._clear_target_edited("Position (deg):")
+        # 输入框里现在存的是“刚下发的指令”，不能被轮询回读改写，
+        # 否则下一次 Set 发的就不是用户填的值了。
+        self.last_sent_speed = self.target_speed.value()
+        self.last_sent_position = self.target_position.value()
+        self._mark_target_edited("Speed (rpm):")
+        self._mark_target_edited("Position (deg):")
 
     def _target_command(self, key):
         """返回某个目标值的 (功能码, 取值函数, 需要的数据字个数)。"""
@@ -1577,12 +1593,15 @@ class MainWindow(QMainWindow):
             return
         if key == "Speed (rpm):":
             self.last_speed_cmd = self.target_speed.value()
+            self.last_sent_speed = self.target_speed.value()
             self._persist_settings()
-            self._clear_target_edited(key)
+            # 发出去之后输入框里存的就是指令本身，锁定它不让轮询回读改写
+            self._mark_target_edited(key)
         elif key == "Position (deg):":
             self.last_position_cmd = self.target_position.value()
+            self.last_sent_position = self.target_position.value()
             self._persist_settings()
-            self._clear_target_edited(key)
+            self._mark_target_edited(key)
         target_mode = {"Speed (rpm):": MODE_SPEED_LOOP,
                        "Position (deg):": MODE_POSITION_LOOP}.get(key)
         # 需要先切模式时，目标值必须等模式生效后再发（见 _switch_mode_for_target）
@@ -1665,24 +1684,55 @@ class MainWindow(QMainWindow):
             self.target_ud.setValue(packet.data2.as_float())
 
     def _mark_target_edited(self, key):
-        """用户在速度/位置框里改过值。标记后回读不再覆盖，直到点了 Set/Get。"""
+        """标记这个输入框由用户掌管（敲过值，或刚发过 Set）。
+
+        标记为 True 后，自动轮询的回读一律不写回输入框，
+        保证框里始终是用户填的指令，下一次 Set 发的值不会被悄悄改掉。
+        """
         self.target_edited[key] = True
 
     def _clear_target_edited(self, key):
+        """交还控制权：允许回读把固件里的值填进输入框（只在显式 Get 时调用）。"""
         self.target_edited[key] = False
+
+    def _detect_speed_scale(self, raw_value):
+        """自动判断固件速度回读用的是哪种单位。
+
+        刚下发过速度时，拿回读值和下发值比一下：
+
+        - 比值 ≈ 1          → 固件回读的就是 rpm（已修复的固件）
+        - 比值 ≈ 1/9.5238095 → 固件回读的是内部 rad/s 值（未修复的固件）
+
+        这样无论板子上烧的是哪个版本，显示都对，不用手改常量。
+        比值落在两者之间（比如被限幅截过）时不乱猜，沿用上次的判断。
+        """
+        sent = self.last_sent_speed
+        if sent is None:
+            # 本次会话还没发过速度，用上次会话存下来的指令当参照
+            sent = self.last_speed_cmd
+        if not sent or abs(sent) < 1e-6 or abs(raw_value) < 1e-6:
+            return
+        ratio = raw_value / sent
+        tol = 0.05
+        if abs(ratio - _FW_RATIO_NEW) < tol:
+            self.firmware_speed_scale = 1.0
+        elif abs(ratio - _FW_RATIO_OLD) < tol:
+            self.firmware_speed_scale = FIRMWARE_SPEED_READBACK_SCALE
 
     def _apply_target_readback(self, key, spin, raw_value):
         """把固件回读的目标值写回输入框。
 
-        速度要乘 FIRMWARE_SPEED_READBACK_SCALE，因为固件回读返回的是内部单位
-        （rad/s），不是用户下发的 rpm。位置没有缩放，原样写回。
-        用户正在编辑（已改未发）时不覆盖，否则打字打到一半会被轮询改写。
+        只在用户没有掌管这个框时才会真正写入（见 _mark_target_edited）：
+        自动轮询碰不到用户填的值，只有显式点 Get All 才会刷新显示。
+        速度要乘自动校准出来的 firmware_speed_scale，位置原样写回。
         """
+        if key == "Speed (rpm):":
+            self._detect_speed_scale(raw_value)
         if self.target_edited.get(key):
             return
         value = raw_value
         if key == "Speed (rpm):":
-            value = raw_value * FIRMWARE_SPEED_READBACK_SCALE
+            value = raw_value * self.firmware_speed_scale
         spin.blockSignals(True)
         spin.setValue(value)
         spin.blockSignals(False)

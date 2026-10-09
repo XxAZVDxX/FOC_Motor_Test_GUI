@@ -124,9 +124,9 @@ far less empty space on a wide screen.
   Currents** / **Auto Refresh** share the next row. The six *Target Values*
   entries each occupy a `label | spin box | Set` triplet, paired two per row, so
   every value can be sent on its own without touching the other five. The speed
-  read-back is scaled by `FIRMWARE_SPEED_READBACK_SCALE` (`1.0` for the patched
-  firmware) and never overwrites a value you are still typing
-  (see *Firmware speed read-back scaling*). The motor
+  read-back is scaled by a factor the GUI detects automatically at runtime (rpm
+  on the patched firmware — see *Firmware speed read-back scaling*) and never
+  overwrites a value you are still typing. The motor
   preview spans the bottom with its readings in a two-column grid underneath the
   dial.
 - **PID Tuning** — the four PID groups form a 2×2 grid instead of a tall column.
@@ -329,6 +329,14 @@ the mode actually has to change, the GUI sends the mode command, waits
 Mode drop-down already shows the loop you are targeting, no mode command is sent at
 all and the value goes out immediately.
 
+**Once you press Set, the box belongs to you.** The 1 s automatic refresh reads the
+targets back from the controller, but it is **not allowed to change a Speed or Position
+box that you have typed into or sent**. Only **Get All** hands the boxes back to the
+controller. Without this rule the refresh silently replaced the value you had just
+commanded with whatever the controller reported, and the next Set sent *that* — which is
+how a correct 100 rpm turned into a shrinking setpoint and a motor that only shook. See
+*Firmware speed read-back scaling* below for the full chain.
+
 The command line follows the same order:
 
 1. Enter the value in the spin box (Speed and Position accept ±100000 with three
@@ -358,21 +366,35 @@ straight into the spin box, the number in the box used to shrink on its own:
 setpoint until the speed loop was left hunting around zero — the motor shook and could
 not turn.
 
-The GUI handles this in two ways:
+The GUI handles this in three ways:
 
-- `handle_target_response` scales the speed read-back by
-  `FIRMWARE_SPEED_READBACK_SCALE` so the box shows the rpm you sent. Position, Iq, Id,
-  Uq and Ud are stored unscaled by the firmware and are written back unchanged.
-- A spin box you have typed into is marked as edited, and the polling read-back skips it
-  until you press **Set** (for that entry or **Set All**) or **Get All**. Typing is never
-  overwritten while you are still entering a value.
+- **The polling read-back can no longer overwrite a command.** A spin box is *owned by
+  the user* as soon as you type into it **or press Set**, and the 1 s auto-refresh skips
+  any owned box. Only an explicit **Get All** hands the boxes back to the controller.
+  This is the important part: earlier the Set handlers *cleared* the flag right after
+  sending, so the very next poll overwrote what you had just commanded — and the
+  following Set sent that overwritten value. That feedback loop was what turned the
+  controller's read-back bug into a shrinking setpoint:
 
-> **The firmware has been fixed.** `Nebula_st_mdk/FOC/AuroFOCCOMM.c`,
+  | cycle | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | old code | 100 | 10.5 | 1.103 | 0.116 | 0.012 | 0.001 | 0 |
+  | current code | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+
+- **The speed read-back scale is auto-detected**, so the displayed number is right on
+  both firmware revisions. `_detect_speed_scale()` compares the value it reads back with
+  the value it last sent: a ratio of `1.0` means the controller returns rpm (patched
+  firmware), a ratio of `1/9.5238095` means it returns internal rad/s (unpatched
+  firmware). `firmware_speed_scale` is then set to match. `FIRMWARE_SPEED_READBACK_SCALE`
+  (`9.5238095`) is only the starting guess used before the first Set of a session.
+- **Position, Iq, Id, Uq and Ud are written back unchanged** — the controller stores
+  those verbatim. A position that the controller clamped is only visible after
+  **Get All**, which is deliberate: the box keeps showing the value you commanded.
+
+> **The firmware has also been fixed.** `Nebula_st_mdk/FOC/AuroFOCCOMM.c`,
 > `motor_aim_speed_param()`, now ends its read branch with
-> `package.data1.f = motorA.aim.aim_speeed_rpm;`, so a `Get` returns rpm directly.
-> **`FIRMWARE_SPEED_READBACK_SCALE` is therefore `1.0`** — do not put the old
-> `9.5238095` back unless you are running an unpatched controller, or the displayed
-> speed will read 9.52× too high.
+> `package.data1.f = motorA.aim.aim_speeed_rpm;`, so a `Get` returns rpm directly, and
+> the scale above detects that automatically. No constant needs editing either way.
 >
 > `FOC/AuroFOCCOMM copy.c` still contains the old bug, but it is **not listed in
 > `MDK-ARM/Nebula_st_mdk.uvprojx`**, so Keil never compiles it. It is dead code.
@@ -397,7 +419,8 @@ see **Firmware fixes in `Nebula_st_mdk`** below. Both the speed read-back bug (w
 made the setpoint shrink towards zero, leaving the speed loop hunting) and the
 un-reset PID integrators (which carried a saturated integral across mode changes and
 Stop) are fixed there. Confirm the speed box still shows the value you typed after the
-auto-refresh has run a few times.
+auto-refresh has run a few times — with the current build it always will, because the
+polling read-back is locked out of a box that holds a command you sent.
 
 If the setpoint is correct and the motor still oscillates, check the **PID Tuning** tab
 next: the Speed-loop gains are not read from the controller on connect, so the spin
@@ -459,6 +482,42 @@ an error and the motor lurched.
 > **cleared**: over 3600 samples its output is exactly `(raw − mechanical_offset) mod 360`
 > with a maximum step of 0.01° per 0.01° of raw input. The apparent jump at raw ≈ 301.46
 > is a correct wrap through 0°. It was left untouched.
+
+A later audit of the same control code cleared the transform chain and found two further
+defects — one in `FOC/AuroFOCCOMM.c` and one in the encoder driver
+`BSP/as5047p_bsp_drv.c`:
+
+**4. The encoder parity counter was never reset on retry** (`BSP/as5047p_bsp_drv.c`,
+`AS5047P_bsp_read_angle`). `num` was initialised once at the top of the function, but the
+parity check is retried with `goto AS5047_RE_READ`. On every retry `num` kept accumulating
+on top of the previous total, so the second attempt produced a value in `[0, 30]` and the
+parity test became meaningless — either looping forever or **accepting a corrupt frame**.
+A corrupt frame makes `as5047p->speed` jump to an impossible value for one refresh; the
+speed loop sees that as a huge error and slams Iq to its limit, which is exactly "shakes
+violently but will not turn". `num = 0;` is now the first statement after the label.
+
+**5. `motor_rotate_direct` was never returned to the GUI** (`AuroFOCCOMM.c`,
+`motor_pole_pair_param`). `data1` and `data2` were filled in but `data3` was left as the
+echoed request word (always `0`), so the Motor Parameters panel's *Encoder Direction* read
+`0` no matter how the board was calibrated. It now returns `motorA.motor_rotate_direct`.
+
+**Cleared by the same audit — do not change these.** The complete
+Clarke → Park → iPark → SVPWM → duty chain was re-implemented in Python and swept over a
+full 360° with `Uq = 1.0, Ud = 0`: the reconstructed αβ vector matches the commanded vector
+at **every** angle, worst-case angle error `0.0000°`, amplitude ratio exactly `1.0`. The
+apparent sign asymmetry between `_foc_park` and `_foc_ipark` is not a bug.
+
+**Open issue: the calibration result is never saved.** `motorA.Pole_Pair`,
+`motorA.motor_rotate_direct` and `motorA.mechanical_offset` are written in exactly two
+places — the hard-coded defaults in `APP/MotorEvent.c` (`7`, `1`, `301.464`) and the
+runtime self-commissioning routine `_foc_calibration_angle_pole_pair_mode` (mode 2).
+There is no flash, EEPROM or backup-register write anywhere in the project, and
+`motor_pole_pair_param` has no write branch, so the controller cannot accept a
+calibrated offset back over the wire either. **Every power cycle therefore reverts the
+board to `7 / ENABLE / 301.464°`.** Those are demo values for a different motor; if they
+do not match the hardware, the current vector is commutated at the wrong rotor angle and
+the motor buzzes instead of turning. To keep a calibration, run mode 2, read the three
+values back with **Get Parameters**, and paste them into `APP/MotorEvent.c`.
 
 ### 5. Tune parameters
 
