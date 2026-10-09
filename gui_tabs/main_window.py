@@ -208,6 +208,7 @@ class MainWindow(QMainWindow):
         self.busy_start = 0
         self.busy_timeout = 150
         self.preview_toggle = True
+        self._last_bus_voltage = None
 
         # 参数自动刷新（电机控制页），同样只在当前页可见时运行
         self.auto_refresh_timer = QTimer()
@@ -814,6 +815,7 @@ class MainWindow(QMainWindow):
         set_param_layout.addRow(clear_cal_btn)
         set_param_group.setLayout(set_param_layout)
         grid.addWidget(set_param_group, 3, 0)
+
         set_param_btn.clicked.connect(self.set_motor_parameters)
         clear_cal_btn.clicked.connect(self.clear_calibration)
 
@@ -895,7 +897,7 @@ class MainWindow(QMainWindow):
         curr_layout.addRow(self._label("Ib:"), self.label_Ib)
         curr_layout.addRow(self._label("Ic:"), self.label_Ic)
         current_group.setLayout(curr_layout)
-        grid.addWidget(current_group, 3, 0)
+        grid.addWidget(current_group, 4, 0)
 
         auto_group = QGroupBox(tr("Auto Refresh"))
         self._text_bindings.append((auto_group, "Auto Refresh", "setTitle"))
@@ -919,7 +921,7 @@ class MainWindow(QMainWindow):
         self.preview_auto_cb.toggled.connect(self.toggle_preview_auto_refresh)
         auto_layout.addWidget(self.preview_auto_cb)
         auto_group.setLayout(auto_layout)
-        grid.addWidget(auto_group, 3, 1)
+        grid.addWidget(auto_group, 3, 1, 2, 1)
 
         preview_group = QGroupBox(tr("Motor Preview"))
         self._text_bindings.append((preview_group, "Motor Preview", "setTitle"))
@@ -956,15 +958,64 @@ class MainWindow(QMainWindow):
         preview_layout.addLayout(info_layout)
         preview_layout.addStretch(1)
         preview_group.setLayout(preview_layout)
-        grid.addWidget(preview_group, 4, 0, 1, 2)
+        grid.addWidget(preview_group, 5, 0, 1, 2)
+
+        # 母线(电源)电压：PA7 经 18k/1k 分压采样，只测量显示，改 Udc 需要手动点按钮。
+        # 采样有噪声，直接拿它自动改 Udc 会让 SVPWM 增益 K 跟着抖，所以做成手动下发。
+        bus_group = QGroupBox(tr("Bus Voltage (PA7)"))
+        self._text_bindings.append((bus_group, "Bus Voltage (PA7)", "setTitle"))
+        bus_layout = QFormLayout()
+        bus_layout.setSpacing(6)
+        self.bus_voltage_label = self._label("Measured: --- V")
+        self.udc_label = self._label("Active Udc: --- V")
+        self.bus_adc_label = self._label("ADC: ---")
+
+        bus_btn_row = QHBoxLayout()
+        bus_btn_row.setSpacing(6)
+        read_bus_btn = self._bind_text(QPushButton(), "Read Bus Voltage")
+        apply_bus_btn = self._bind_text(QPushButton(), "Apply as Udc")
+        apply_bus_btn.setToolTip(tr(
+            "Use the last measured value as Udc; K is recomputed on the firmware"))
+        bus_btn_row.addWidget(read_bus_btn)
+        bus_btn_row.addWidget(apply_bus_btn)
+        bus_btn_row.addStretch(1)
+
+        # 手动写入窗口：实测值和想用的值不一致时可以自己填
+        self.set_udc_spin = QDoubleSpinBox()
+        self.set_udc_spin.setRange(6.0, 60.0)
+        self.set_udc_spin.setDecimals(2)
+        self.set_udc_spin.setSingleStep(0.5)
+        self.set_udc_spin.setValue(12.0)
+        set_udc_btn = self._bind_text(QPushButton(), "Set")
+        udc_row = QHBoxLayout()
+        udc_row.setSpacing(6)
+        udc_row.addWidget(self.set_udc_spin)
+        udc_row.addWidget(set_udc_btn)
+        udc_row.addStretch(1)
+
+        bus_layout.addRow(self.bus_voltage_label)
+        bus_layout.addRow(self.udc_label)
+        bus_layout.addRow(self.bus_adc_label)
+        bus_layout.addRow(bus_btn_row)
+        bus_layout.addRow(self._label("Set Udc (V):"), udc_row)
+        bus_group.setLayout(bus_layout)
+        grid.addWidget(bus_group, 6, 0, 1, 2)
 
         # 显示区比输入区更值得占用多余宽度，行 2/3 也允许拉伸
         grid.setColumnStretch(0, 3)
         grid.setColumnStretch(1, 2)
         grid.setRowStretch(2, 1)
-        grid.setRowStretch(3, 1)
-        grid.setRowStretch(4, 2)
+        grid.setRowStretch(3, 0)
+        grid.setRowStretch(4, 0)
+        grid.setRowStretch(5, 2)
         layout.addLayout(grid)
+
+        self.read_bus_btn = read_bus_btn
+        self.apply_bus_btn = apply_bus_btn
+        self.set_udc_btn = set_udc_btn
+        read_bus_btn.clicked.connect(self.read_bus_voltage)
+        apply_bus_btn.clicked.connect(self.apply_measured_as_udc)
+        set_udc_btn.clicked.connect(self.set_udc_value)
 
         self.set_mode_btn.clicked.connect(self.set_motor_mode)
         self.get_mode_btn.clicked.connect(self.get_motor_mode)
@@ -1398,7 +1449,7 @@ class MainWindow(QMainWindow):
         if packet.func1 != 0x1A:
             return
 
-        if packet.func2 in (0x30, 0x31, 0x32, 0x33) and self.auto_refresh_enabled:
+        if packet.func2 in (0x30, 0x31, 0x32, 0x33, 0x39) and self.auto_refresh_enabled:
             self.is_busy = False
 
         if packet.func2 == 0x00 and packet.func3 == 0x00:
@@ -1435,6 +1486,10 @@ class MainWindow(QMainWindow):
             self.handle_speed(packet)
         elif packet.func2 == 0x33:
             self.handle_position(packet)
+        elif packet.func2 == 0x39:
+            self.handle_bus_voltage_response(packet)
+        elif packet.func2 == 0x3B:
+            self.handle_udc_response(packet)
         elif packet.func2 == 0x3D:
             self.decode_imu_packet(packet)
 
@@ -1570,6 +1625,59 @@ class MainWindow(QMainWindow):
         if mid == 0:
             return
         self.send_command(0x02, 0x00, motor_id=mid)
+
+    # ---------- 母线电压 / Udc ----------
+    def read_bus_voltage(self, quiet=False):
+        """主动读一次母线电压。quiet=True 时用于自动轮询，不弹提示。"""
+        mid = self.get_current_motor_id()
+        if mid == 0:
+            if not quiet:
+                QMessageBox.warning(self, tr("Warning"), tr("No motor ID selected"))
+            return
+        self.send_command(0x39, 0x00, motor_id=mid)
+
+    def handle_bus_voltage_response(self, packet):
+        """固件应答 0x39：data1=实测电压, data2=当前 Udc, data3=K, data4=原始 ADC 码。"""
+        voltage = packet.data1.as_float()
+        udc = packet.data2.as_float()
+        adc = int(round(packet.data4.as_float()))
+        if voltage < 0.0:
+            # 固件侧 ADC 启动或转换失败返回 -1.0，别把负值当成真电压显示
+            self.bus_voltage_label.setText(tr("Measured: --- V"))
+            self.status_label.setText(tr("Bus voltage read failed"))
+            return
+        self.bus_voltage_label.setText(
+            tr("Measured: {v} V").format(v=f"{voltage:.2f}"))
+        self.bus_adc_label.setText(tr("ADC: {n}").format(n=adc))
+        self.udc_label.setText(tr("Active Udc: {v} V").format(v=f"{udc:.2f}"))
+        self._last_bus_voltage = voltage
+
+    def handle_udc_response(self, packet):
+        """固件应答 0x3B：data1=当前 Udc, data2=当前 K（写入后回读也是这个格式）。"""
+        udc = packet.data1.as_float()
+        self.udc_label.setText(tr("Active Udc: {v} V").format(v=f"{udc:.2f}"))
+        self.set_udc_spin.setValue(max(6.0, min(60.0, udc)))
+
+    def apply_measured_as_udc(self):
+        """把最后一次实测值填进输入框。不直接下发——下发必须再点一次 Set。"""
+        measured = getattr(self, "_last_bus_voltage", None)
+        if measured is None:
+            QMessageBox.warning(self, tr("Warning"),
+                                tr("Read the bus voltage first"))
+            return
+        self.set_udc_spin.setValue(max(6.0, min(60.0, measured)))
+        self.status_label.setText(
+            tr("Measured voltage copied to Udc box; press Set to write"))
+
+    def set_udc_value(self):
+        """手动写入 Udc，固件会同步重算 K = sqrt(3)*Ts/Udc。"""
+        mid = self.get_current_motor_id()
+        if mid == 0:
+            QMessageBox.warning(self, tr("Warning"), tr("No motor ID selected"))
+            return
+        udc = float(self.set_udc_spin.value())
+        self.send_command(0x3B, 0x01, udc, motor_id=mid)
+        self.status_label.setText(tr("Udc set to {v} V").format(v=f"{udc:.2f}"))
 
     def handle_pole_pair_response(self, packet):
         # func3=0x00 是读取应答，0x01 是写入后的回读应答，两种都要刷新界面
@@ -2190,6 +2298,8 @@ class MainWindow(QMainWindow):
         self.get_pid("Id")
         self.get_pid("Speed")
         self.get_pid("Position")
+        # 母线电压也顺手读一次，方便观察电源是否掉压
+        self.read_bus_voltage(quiet=True)
 
     # ==================== IMU 相关函数 ====================
     def request_imu_data(self):

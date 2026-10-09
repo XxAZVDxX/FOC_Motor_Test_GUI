@@ -98,6 +98,25 @@ _ZH_CN = {
     "Disable": "禁用",
     "Clear Calibration": "清除校准记录",
 
+    # ── bus voltage (PA7) ─────────────────────────────────────────
+    "Bus Voltage (PA7)": "母线电压 (PA7)",
+    "Read Bus Voltage": "读取母线电压",
+    "Apply as Udc": "应用为 Udc",
+    "Measured: --- V": "实测: --- V",
+    "Measured: {v} V": "实测: {v} V",
+    "Active Udc: --- V": "当前 Udc: --- V",
+    "Active Udc: {v} V": "当前 Udc: {v} V",
+    "ADC: ---": "ADC: ---",
+    "ADC: {n}": "ADC: {n}",
+    "Set Udc (V):": "设置 Udc (V):",
+    "Use the last measured value as Udc; K is recomputed on the firmware":
+        "把最近一次实测值作为 Udc；固件会同步重算 K",
+    "Read the bus voltage first": "请先读取母线电压",
+    "Bus voltage read failed": "母线电压读取失败",
+    "Measured voltage copied to Udc box; press Set to write":
+        "实测值已填入 Udc 输入框，请点 Set 生效",
+    "Udc set to {v} V": "Udc 已设为 {v} V",
+
     # ── targets ───────────────────────────────────────────────────
     "Target Values": "目标值",
     "Iq:": "Iq：",
@@ -341,6 +360,25 @@ _ZH_TW = {
     "Set Motor Parameters": "寫入馬達參數",
     "Disable": "停用",
     "Clear Calibration": "清除校準記錄",
+
+    # ── bus voltage (PA7) ─────────────────────────────────────────
+    "Bus Voltage (PA7)": "母線電壓 (PA7)",
+    "Read Bus Voltage": "讀取母線電壓",
+    "Apply as Udc": "套用為 Udc",
+    "Measured: --- V": "實測: --- V",
+    "Measured: {v} V": "實測: {v} V",
+    "Active Udc: --- V": "目前 Udc: --- V",
+    "Active Udc: {v} V": "目前 Udc: {v} V",
+    "ADC: ---": "ADC: ---",
+    "ADC: {n}": "ADC: {n}",
+    "Set Udc (V):": "設定 Udc (V):",
+    "Use the last measured value as Udc; K is recomputed on the firmware":
+        "把最近一次實測值作為 Udc；韌體會同步重算 K",
+    "Read the bus voltage first": "請先讀取母線電壓",
+    "Bus voltage read failed": "母線電壓讀取失敗",
+    "Measured voltage copied to Udc box; press Set to write":
+        "實測值已填入 Udc 輸入框，請點 Set 生效",
+    "Udc set to {v} V": "Udc 已設為 {v} V",
 
     # ── targets ───────────────────────────────────────────────────
     "Target Values": "目標值",

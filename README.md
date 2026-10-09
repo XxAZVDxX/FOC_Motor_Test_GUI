@@ -696,6 +696,113 @@ every `CCR` inside `[0, 4249]`. The 0.05 floor is 212 counts, comfortably clear 
 50-count (≈294 ns) dead time configured in `Core/Src/tim.c`. The `+ 0.5f` before the `uint16_t` cast also fixes a separate
 small loss: the old code truncated, throwing away up to 1 LSB (0.235 ‰ of full scale).
 
+**14. The DC bus voltage is now measured on PA7, and `Udc` can be corrected from the GUI**
+(`FOC/AuroFOCCOMM.c`, `FOC/AuroFOCCOMM.h`, `APP/MotorEvent.c` comment only; `COMM/protocol.h`
+was deliberately left untouched).
+The board's 电源采样 divider was previously **dead hardware**: `MX_ADC2_Init()` scans two
+channels — `ADC2_IN3` (PA6, the NTC) at `ADC_REGULAR_RANK_1` and `ADC2_IN4` (PA7, VBAT) at
+`ADC_REGULAR_RANK_2` — but `motor_temp_param()` polled the ADC **once** and therefore only
+ever read rank 1. PA7's result was never fetched.
+
+### The divider
+
+`VBAT --18 kΩ--> PA7 --1 kΩ--> GND`, plus 100 nF from PA7 to GND. The ratio is therefore
+
+$$V_{BUS} = \text{adc} \cdot \frac{V_{REF}}{4095} \cdot \frac{18\,\text{k}+1\,\text{k}}{1\,\text{k}} = \text{adc} \cdot \frac{3.3}{4095} \cdot 19 = \text{adc} \cdot 0.0153114\ \text{V}$$
+
+| Quantity | Value |
+|---|---|
+| Divider gain | 19 (ratio 1/19 = 0.0526316) |
+| Full scale | **62.7 V** |
+| 1 LSB | **15.3 mV** (0.064 % of 24 V) |
+| Filter τ | 947 Ω · 100 nF ≈ **95 µs** (≈ 12× attenuation of the 20 kHz PWM ripple) |
+| 12 V ⇒ adc | 784 |
+| 24 V ⇒ adc | 1567 |
+| 48 V ⇒ adc | 3135 |
+
+The one-sided RC is why an averaged single read is good enough here — the sampled node is
+already smoothed 12× below the switching frequency.
+
+### Why two polls are required
+
+With `ScanConvMode = ENABLE`, `NbrOfConversion = 2`, `EOCSelection = ADC_EOC_SINGLE_CONV`
+and `ContinuousConvMode = DISABLE`, one `HAL_ADC_Start()` runs rank 1 → rank 2 and then
+stops, raising **exactly two** `EOC` flags. `HAL_ADC_PollForConversion()` waits for one
+`EOC` per call, so the standard idiom applies:
+
+```c
+HAL_ADC_Start( &hadc2 );
+HAL_ADC_PollForConversion( &hadc2 , 100 ); *ntc  = HAL_ADC_GetValue( &hadc2 ); /* rank 1: PA6 */
+HAL_ADC_PollForConversion( &hadc2 , 100 ); *vbus = HAL_ADC_GetValue( &hadc2 ); /* rank 2: PA7 */
+HAL_ADC_Stop( &hadc2 );
+```
+
+Reading only one rank leaves the sequence mid-flight, so the *next* call returns a stale
+sample from the other channel. `_bus_adc_read()` wires this up once and both
+`motor_temp_param()` and the new bus-voltage handler go through it. At a 42.5 MHz ADC clock
+(170 MHz / `ADC_CLOCK_SYNC_PCLK_DIV4`) each 12.5-cycle conversion is ≈ 294 ns, so the pair
+costs ≈ 1.2 µs — negligible inside the 1 ms `TIM6` task that runs `package_poll_send()`.
+This is deliberately **not** in the 40 kHz injected ISR; the injected callback guards
+`hadc == &hadc1`, so ADC2 can never disturb the current loop.
+
+### New commands
+
+| `func2` | `func3` | Meaning |
+|---|---|---|
+| `0x39` | `0x00` | Read bus voltage. `data1` = volts, `data2` = active `Udc`, `data3` = active `K`, `data4` = raw ADC code |
+| `0x3B` | `0x00` | Read back `Udc` (`data1`) and `K` (`data2`) |
+| `0x3B` | `0x01` | Write `Udc` (`data1`); firmware clamps to `[6, 60] V` and recomputes `K = √3·Ts/Udc` |
+
+`data4` on `0x39` returns the raw ADC code on purpose: it is the quickest way to confirm the
+divider on the bench. Power the board from a known 12 V supply and check that the code
+reads ≈ 784 and the reported voltage ≈ 12.0 V. **If the voltage reads about 19× too high,
+the bottom 1 kΩ leg is not fitted** — stop, because 24 V on a 3.3 V pin would damage PA7.
+
+The GUI side adds a **Bus Voltage (PA7)** group to the Motor Control tab with a
+**Read Bus Voltage** button and an **Apply as Udc** button. Applying is deliberately a
+**manual, two-step** action: the reading is copied into the `Set Udc (V)` box and a separate
+**Set** click sends `0x3B/0x01`. Nothing in the poll path ever writes `Udc`. `Udc` feeds
+`K = √3·Ts/Udc`, so letting a noisy ADC reading update it automatically would modulate the
+SVPWM gain every second.
+
+### Why this matters for the Round-12 fix
+
+`APP/MotorEvent.c` still ships `motorA.Udc = 12` (line 128) with `max_uq = max_ud = 6 V`.
+That is self-consistent **only if the bench supply really is 12 V**:
+
+| `Udc` | `K = √3·Ts/Udc` | SVPWM linear ceiling `Udc/√3` | Speed ceiling at 32 rpm/V |
+|---|---|---|---|
+| 12 V | 0.144338 | 6.93 V | ≈ 222 rpm |
+| 24 V | 0.072169 | 13.86 V | ≈ 443 rpm |
+
+If the supply turns out to be 24 V while `Udc` stays at 12, `K` is **twice** too large: the
+firmware believes it is applying half the voltage it actually is, the current loop gain is
+doubled, and the `6 V` limit corresponds to 12 V of real output. **Read PA7 first, then set
+`Udc` to the measured value.** (A 12 V bus is also what makes the Round-12 distortion
+threshold coherent: the old `[0, 0.8]` clamp only produced its asymmetric flat-top above
+`0.8·Udc/√3 = 5.54 V`, which `Uq = 6 V` can reach on a 12 V bus but not on 24 V.)
+
+### Limits that are too permissive for this motor
+
+The datasheet photo (HT4310) gives **24 V nominal, 14 pole pairs, 690 rpm max no-load**, and
+32 rpm/V. Two compiled-in limits disagree with it:
+
+* `max_speed = 1000` — the motor's no-load maximum is **690 rpm**, and the SVPWM ceiling
+  above caps it near 222 rpm (12 V bus) anyway.
+* `max_iq = max_id = 4 A` — **stall current is 1.8 A** and nominal current is 0.97 A, so the
+  limit permits more than twice the stall current.
+
+The pole pair is the useful confirmation: the datasheet's **14** matches the field
+calibration exactly (Pole Pairs 14, Zero Offset 55.261°, Encoder Direction 0), which
+independently validates the Round-10 pole-pair arithmetic fix.
+
+**The layout fix that came with it.** The Motor Control tab had a real grid bug: both
+`set_param_group` (Set Motor Parameters) and `current_group` (Phase Currents) were added to
+cell `(3, 0)`, so their group-box titles were painted on top of each other and the tab
+showed an unreadable *"S̶e̶t̶ ̶M̶o̶t̶o̶r̶ ̶P̶a̶r̶a̶m̶e̶t̶e̶r̶s̶ Phase Currents"* header.
+`current_group` moved to the free `(4, 0)`, `Auto Refresh` now spans rows 3–4, the preview
+moved to row 5 and the new bus group sits at row 6.
+
 **Cleared by the same audit — do not change these.** The complete
 Clarke → Park → iPark → SVPWM → duty chain was re-implemented in Python and swept over a
 full 360° with `Uq = 1.0, Ud = 0`: the reconstructed αβ vector matches the commanded vector
