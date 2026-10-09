@@ -632,6 +632,70 @@ build cannot run 20 kHz inside a 50 µs ISR.
 — the record is written to flash page 63, so the values in item 11's screenshot survive a
 reboot.
 
+**13. The SVPWM duty limiter was asymmetric, capping the output voltage at 4.16 V**
+(`FOC/AuroFOC.c`, `_foc_update_pwm`). The old code clamped each leg into `[0, 0.8]`:
+
+```c
+tu = (tu > 0.8f) ? 0.8f : (tu < 0.0f) ? 0.0f : tu;   /* ×3 legs */
+```
+
+This is wrong in two independent ways:
+
+* **The ceiling is 0.8, not 1.0.** The highest leg of an SVPWM frame is `0.5 + span/2`, so
+  a 0.8 ceiling caps `span` at 0.6 — and `span = |V|·√3/Udc` — giving an effective linear
+  ceiling of `0.8·Udc/√3 = 0.8×12/1.7320508 = 4.157 V`, not the theoretical `Udc/√3 = 6.928 V`.
+* **It only clamps the high side.** The lowest leg is `0.5 − span/2`, which does not reach
+  0 until `|V| > 5.54 V`. So between 4.16 V and 5.54 V *only the top leg flattens*, with no
+  compensation at the mid-point. The duty triple no longer represents the commanded αβ
+  vector — it acquires a **DC offset and a flat-top distortion** that rotates with the
+  electrical angle. Swept over a full electrical revolution: 0 % of angles clipped at
+  `|V| ≤ 4.0 V`, **75 % at 4.5 V**, and **100 % from 5.0 V up**, with the peak vector error
+  growing monotonically (0.20 V at 4.5 V, 0.49 at 5.0, 1.06 at 6.0, 1.60 at 6.93).
+
+Because `max_uq = max_ud = 6 V` (`APP/MotorEvent.c`), the commanded voltage legitimately
+exceeds 4.157 V whenever the loop demands high torque — which is exactly and only at high
+speed. The distortion is a **torque ripple** at the electrical frequency and its harmonics.
+It is far too fast to see on the shaft, but it is directly palpable by hand, which matches
+the report of a high-speed-only vibration that is invisible in the telemetry (the
+`0x30`–`0x33` frames carry no `Uq`/`Ud`/duty values at all).
+
+The fix replaces the two-sided clamp with a **symmetric mid-point limiter**: find the frame's
+`max`/`min`, scale the triple about `(max+min)/2` by a single factor `k`, and only reduce `k`
+when the span exceeds the available range.
+
+```c
+#define PWM_DUTY_MAX      0.95f
+#define PWM_DUTY_MIN      0.05f
+#define PWM_PERIOD_COUNT  4250.0f
+
+mx = tu; if( tv > mx ) mx = tv; if( tw > mx ) mx = tw;
+mn = tu; if( tv < mn ) mn = tv; if( tw < mn ) mn = tw;
+mid  = 0.5f * ( mx + mn );
+half = 0.5f * ( mx - mn );
+lim  = 0.5f * ( PWM_DUTY_MAX - PWM_DUTY_MIN );
+k    = ( half > lim ) ? ( lim / half ) : 1.0f;
+tu = 0.5f + ( tu - mid ) * k;   /* ×3 legs */
+```
+
+Because the Clarke transform is common-mode invariant, subtracting the mid-point and
+scaling by a single `k` **preserves the commanded angle exactly** and only attenuates the
+magnitude — which is what removes the ripple. Swept in bit-exact `float32` over the whole
+`0…8 V` disc (`k` and the `0.95` span were chosen so nothing clips until `|V| > 5.5 V`):
+
+| \|V\| | max vector error, old | max vector error, new | angle error |
+|---|---|---|---|
+| ≤ 4.0 V | 0.0000 | 7.6e-7 | 0.0000° |
+| 4.5 V | 0.1981 | 7.5e-7 | 0.0000° |
+| 5.0 V | 0.4868 | 7.6e-7 | 0.0000° |
+| 5.5 V | 0.7754 | 8.0e-7 | 0.0000° |
+| 6.0 V | 1.0641 | 7.7e-7 | 0.0000° |
+| 6.928 V | 1.5999 | 0.6930 (graceful) | 0.0000° |
+
+The residual is `float32` round-off (~1e-6 V). Every duty stays inside `[0.05, 0.95]` and
+every `CCR` inside `[0, 4249]`. The 0.05 floor is 212 counts, comfortably clear of the
+50-count (≈294 ns) dead time configured in `Core/Src/tim.c`. The `+ 0.5f` before the `uint16_t` cast also fixes a separate
+small loss: the old code truncated, throwing away up to 1 LSB (0.235 ‰ of full scale).
+
 **Cleared by the same audit — do not change these.** The complete
 Clarke → Park → iPark → SVPWM → duty chain was re-implemented in Python and swept over a
 full 360° with `Uq = 1.0, Ud = 0`: the reconstructed αβ vector matches the commanded vector
