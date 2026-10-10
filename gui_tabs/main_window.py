@@ -1556,7 +1556,7 @@ class MainWindow(QMainWindow):
                 ids.append(val & 0xFFFF)
         if packet.motor_id != 0xFFFF:
             ids.append(packet.motor_id)
-        ids = list(set(ids))
+        ids = [i for i in dict.fromkeys(ids) if i != 0xFFFF]
         self.detected_ids = ids
         self.motor_id_combo.clear()
         connected = self.comm_backend is not None

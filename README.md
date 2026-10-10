@@ -741,9 +741,15 @@ Reading only one rank leaves the sequence mid-flight, so the *next* call returns
 sample from the other channel. `_bus_adc_read()` wires this up once and both
 `motor_temp_param()` and the new bus-voltage handler go through it. At a 42.5 MHz ADC clock
 (170 MHz / `ADC_CLOCK_SYNC_PCLK_DIV4`) each 12.5-cycle conversion is ≈ 294 ns, so the pair
-costs ≈ 1.2 µs — negligible inside the 1 ms `TIM6` task that runs `package_poll_send()`.
-This is deliberately **not** in the 40 kHz injected ISR; the injected callback guards
-`hadc == &hadc1`, so ADC2 can never disturb the current loop.
+costs ≈ 1.2 µs once the ADC is running.
+
+> **Superseded.** The `HAL_ADC_Start()` / `HAL_ADC_PollForConversion()` / `HAL_ADC_Stop()`
+> idiom shown above was correct in principle but unsafe in practice: this function runs in
+> **interrupt context**, where those calls' `HAL_GetTick()` timeouts can never fire. It also
+> assumed the ADC was already enabled, which `HAL_ADC_Init()` does not do. `_bus_adc_read()`
+> is now register level and tick-free — see **item 16**. The 1.2 µs figure also applies only
+> to the steady state; the very first call additionally has to enable the ADC and wait for
+> `ADRDY`.
 
 ### New commands
 
@@ -808,6 +814,264 @@ Clarke → Park → iPark → SVPWM → duty chain was re-implemented in Python 
 full 360° with `Uq = 1.0, Ud = 0`: the reconstructed αβ vector matches the commanded vector
 at **every** angle, worst-case angle error `0.0000°`, amplitude ratio exactly `1.0`. The
 apparent sign asymmetry between `_foc_park` and `_foc_ipark` is not a bug.
+
+**15. RS485 transmission blocked the 1 ms task, and one overrun killed the receive path
+permanently** (`COMM/protocol.c`, `APP/User_APP.c`, `Core/Src/usart.c`, `Core/Inc/usart.h`).
+Symptom: after flashing a board, the GUI could **detect** the motor over USB but could not
+control it at all over RS485 — `rs485_rx_bytes` climbed to a value and then froze forever
+while `rs485_tx_bytes` kept rising, and `rs485_data` stayed `0`.
+
+> **Scope note.** This is a real defect in the RS485 code path, verified line by line in the
+> HAL source, and it is worth keeping. It is **not** the cause of the "detected but
+> uncontrollable" symptom on the bench, because the bench board is driven over **USB CDC
+> (Type-C)**, not RS485. The USB path is covered by item 16.
+
+### The frame does not fit in the poll period
+
+`package_send()` sent every RS485 frame with a **blocking** transmit:
+
+```c
+HAL_GPIO_WritePin(RS485_EN_GPIO_Port, RS485_EN_Pin, GPIO_PIN_SET);
+HAL_UART_Transmit(&huart3, data, sizeof(data), 0xFFFF);
+for (volatile int i = 0; i < 200; i++);   /* guess-the-timing busy-wait */
+HAL_GPIO_WritePin(RS485_EN_GPIO_Port, RS485_EN_Pin, GPIO_PIN_RESET);
+```
+
+`package_send()` is reached from `package_poll_send()` → `motor_poll_send()` inside the
+**1 ms `TIM6` interrupt**. At 8N1 a 24-byte frame costs `24 · 10 / baud`:
+
+| Port | Baud | 24-byte frame | TIM6 period | Verdict |
+|---|---|---|---|---|
+| `huart1` (USB) | 2 000 000 | 0.1200 ms | 1.0000 ms | fits — harmless |
+| `huart3` (RS485) | 115 200 | **2.0833 ms** | 1.0000 ms | **208 % of the period** |
+
+This asymmetry is the whole reason "detect works but RS485 does not": the identical code is
+fine on the 2 Mbaud USB link and fatal on the 115 kbaud RS485 link. Three consequences
+follow, in order of severity:
+
+1. **The 1 ms task is saturated.** Each frame consumes more than two full periods, and
+   `TICK_INT_PRIORITY` equals TIM6's pre-emption priority, so the HAL's `HAL_GetTick()`
+   timeout cannot even advance while the transmit runs.
+2. **The receiver is muted for the duration.** `RS485_EN` is driven high for the whole
+   ~2.1 ms, so the transceiver cannot hear anything the GUI sends in that window.
+3. **A single lost byte kills the receive path forever.** See below.
+
+### Why one overrun is permanent
+
+This is the exact chain, verified against the vendored HAL source rather than inferred.
+In `Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_uart.c`:
+
+1. `HAL_UART_IRQHandler()` (**line 2209**) computes `errorflags`; the ORE branch
+   (**line 2270**) clears `OREF` and sets `huart->ErrorCode |= HAL_UART_ERROR_ORE`.
+2. Because `errorcode & (RTO | ORE)` is non-zero, the "blocking error" test
+   (**line 2303**) calls **`UART_EndRxTransfer(huart)`** (**line 2308**).
+3. **`UART_EndRxTransfer()` (line 3577) disables `RXNEIE` and `PEIE` in `CR1`, disables
+   `EIE` and `RXFTIE` in `CR3`, sets `RxState = HAL_UART_STATE_READY`, and sets
+   `RxISR = NULL`.**
+4. It then calls `HAL_UART_ErrorCallback(huart)` — which was the **`__weak` empty stub at
+   line 2599**, because `USE_HAL_UART_REGISTER_CALLBACKS` is `0` (**`stm32g4xx_hal_conf.h:107**)
+   and the project had **no override anywhere** in `APP/`, `Core/Src/`, `COMM/` or `FOC/`.
+
+So `HAL_UART_RxISR_8BIT` stops being reached on USART3, `HAL_UART_RxCpltCallback` never
+fires again, and the 1-byte re-arm inside it never runs. **RX stays dead until the next
+reset** — exactly the observed freeze. There is no other re-arm point in the project, and
+`HAL_UART_Receive_IT()` alone cannot recover it because it returns `HAL_BUSY` *without
+touching any register* whenever `RxState != HAL_UART_STATE_READY`.
+
+Note that the 1-byte registration in `RS485_Start_Receive()` (`Core/Src/usart.c`) and the
+immediate re-arm in `HAL_UART_RxCpltCallback` were **already correct**. The defect was never
+in the registration; it is that the callback stops being reached.
+
+### The fix
+
+* **Non-blocking transmit** (`COMM/protocol.c`). `HAL_UART_Transmit_IT()` replaces the
+  blocking call, so the 1 ms task is released immediately. Because the transmit is now
+  asynchronous and `package_send()` rewrites the shared `data[24]` on every call, the frame
+  is copied into a dedicated `static uint8_t rs485_tx_data[24]` staging buffer first —
+  without that copy the next frame would overwrite a frame still in flight and the wire
+  would carry spliced garbage. A `huart3.gState == HAL_UART_STATE_READY` guard drops a frame
+  when the port is busy, which is safe for a periodic-report protocol and far better than
+  blocking. `RS485_EN` is raised before the call and lowered only if the call fails.
+* **`HAL_UART_TxCpltCallback`** (`APP/User_APP.c`). `UART_EndTransmit_IT()` (**line 4132**)
+  invokes it after the final stop bit, so `RS485_EN` is released precisely instead of after
+  the old guess-the-timing busy-wait. `HAL_UART_Transmit_IT` does **not** set `TCIE` itself —
+  `UART_TxISR_8BIT` enables it when the last byte is queued — so the callback fires exactly once.
+* **`HAL_UART_ErrorCallback`** (`APP/User_APP.c`). Clears PE/FE/NE/ORE, resets `ErrorCode`,
+  and re-arms both UARTs, with a `RxState = HAL_UART_STATE_READY` force-reset fallback. This
+  is the actual cure: it turns permanent RX death into a recoverable dropped frame. It also
+  releases `RS485_EN` for `huart3` unless a transmit is genuinely in flight, so a mid-frame
+  fault cannot leave the transceiver muted forever.
+* **Shared receive buffer** (`Core/Src/usart.c`, `Core/Inc/usart.h`). `rs485_rx_data` was a
+  function-local `static` inside `RS485_Start_Receive()`, i.e. invisible to the error
+  callback. It is now file-scope with an `extern` declaration, so the error callback and the
+  RX-complete callback arm the **same** buffer instead of two different ones.
+
+### What was ruled out
+
+* A stale `RS485_Rx_Init()` / `RS485_Scan()` / `stm32_main.c` BoardComm layer was suspected
+  of holding `gState` busy with a one-shot 64-byte `HAL_UART_Receive_IT`. **Those symbols do
+  not exist anywhere in `FOC_Motor_Project`.**
+* The RX registration being wrong. It was already exactly 1 byte, already re-armed on every
+  completion. **No change was needed here.**
+* `ADC2` hanging the 1 ms task. The log's injected-ADC intervals were Doppler-shifted to
+  50.02 µs, proving the timebase never stalled. `ADC2` is instantaneous.
+
+### Still worth doing on the bench
+
+* **Confirm the fix** by re-flashing and watching `rs485_rx_bytes` climb again and
+  `rs485_data` become non-zero while the GUI sends commands. The root cause is proven from
+  the HAL source, but the fix has not yet been scope-verified.
+* **Check that the RS485 adapter really runs at 115200.** A GUI/firmware baud mismatch is a
+  simpler and equally plausible cause of zero received bytes and has not been excluded.
+* **The poll period is still too fast for the bus.** At 2.0833 ms per frame, a 1 ms poll can
+  use the link at most ~48 % of the time even with a non-blocking transmit. A dedicated
+  slower RS485 poll (≥ 3 ms), or sending only when the port is idle, would remove the
+  remaining frame drops. Not required to stop the overrun death.
+
+**16. The bus-voltage poll ran a HAL ADC conversion inside the USB interrupt, and that
+interrupt can never time out** (`FOC/AuroFOCCOMM.c`, `COMM/protocol.c`; GUI
+`gui_tabs/main_window.py`). Symptom: after flashing a board and connecting over **Type-C**,
+the GUI detects the motor ID but **nothing else responds** — mode read-back, targets, PID
+values and the live plots all stay frozen.
+
+This is a **pre-existing vendor defect** that was dormant until the PA7 bus-voltage feature
+(item 14) gave it a caller that runs automatically on every connect.
+
+### Why the detection reply still gets through
+
+`package_analysis()` runs in **interrupt context**. It is reached from four callers, and the
+one that matters on the bench is the USB one:
+
+| Caller | File |
+|---|---|
+| `CDC_Receive_FS` (the live Type-C path) | `USB_Device/App/usbd_cdc_if.c:269` |
+| `HAL_FDCAN_RxFifo0Callback` | `Core/Src/fdcan.c:105` |
+| `HAL_UART_RxCpltCallback` (USART1 / USART3) | `APP/User_APP.c:57`, `:61` |
+
+The motor-ID reply is sent **inline, from inside that same interrupt**
+(`motor_detect_param()` in `FOC/AuroFOCCOMM.c` calls `package_send()` directly and never
+checks the target ID), so the GUI receives it and the ID appears in the dropdown. Everything
+after that is queued behind the interrupt — which is where the board stops answering.
+
+### The priority inversion
+
+| Interrupt | Pre-empt priority | Where |
+|---|---|---|
+| `ADC1_2_IRQn` | 0 | `Core/Src/adc.c:226`, `:264` |
+| `USB_LP_IRQn` | **1** | `USB_Device/Target/usbd_conf.c:95` |
+| `USART1_IRQn` / `USART3_IRQn` | **1** | `Core/Src/usart.c:174`, `:214` |
+| `TIM1_UP_TIM16_IRQn` | 0 | `Core/Src/tim.c:262` |
+| `TIM6_DAC_IRQn` (the 1 ms poll) | 2 | `Core/Src/tim.c:277` |
+| **SysTick (`TICK_INT_PRIORITY`)** | **2** | `Core/Inc/stm32g4xx_hal_conf.h:184` |
+
+`HAL_GetTick()` only advances from SysTick. At pre-empt priority **1**, SysTick (priority 2)
+is **masked**, so `HAL_GetTick()` returns a frozen value. Every tick-based HAL ADC timeout
+therefore compares `0 > timeout`, which is never true:
+
+| Function | Tick variable | Timeout test |
+|---|---|---|
+| `HAL_ADC_Start` → `ADC_Enable` | `tickstart` 3483 | `> ADC_ENABLE_TIMEOUT` 3500 |
+| `HAL_ADC_PollForConversion` | `tickstart` 1480 | `> Timeout` 1488 |
+| `HAL_ADC_Stop` → `ADC_Disable` | `tickstart` 3560 | `> ADC_DISABLE_TIMEOUT` 3564 |
+
+`HAL_ADC_Init()` is *not* the problem: it never calls `ADC_Enable`, it only starts the
+internal regulator, so **ADC2 is left disabled (`ADEN == 0`)** after boot. The first
+`HAL_ADC_Start()` therefore has to run the full `ADC_Enable` path — including the `ADRDY`
+wait at 3485 — and if `ADRDY` does not come up, that wait **never ends**. The core sits in
+the USB interrupt forever: the device still enumerates, the detect reply already went out,
+and the firmware never returns to `main()` again.
+
+### The trigger chain
+
+The wedge is armed automatically, every time the GUI connects:
+
+1. `connect_device()` → `detect_motor_id(auto=True)` → sends `0x00`.
+2. Firmware answers inline → `handle_detect_response()`.
+3. `motor_id_combo.clear()` + `addItem(...)` (`main_window.py:1561`, `:1565`).
+4. That repopulation fires `currentIndexChanged`, which is **connected at line 757** →
+   `on_motor_id_changed()` → `_apply_polling_gates()` → `_sync_auto_refresh_timer(True)`.
+5. `refresh_all_except_mode()` ends with `read_bus_voltage(quiet=True)` (line 2302) →
+   `send_command(0x39, 0x00)` (line 1637).
+6. Firmware dispatches `0x39` → `motor_bus_voltage_param()` → `_bus_adc_read()` → wedge.
+
+The GUI has no lock-out of its own: `is_busy` only gates `request_next_preview()` and
+`request_currents()`, never a manual send. The board simply never answers again.
+
+### The fix
+
+`_bus_adc_read()` in `FOC/AuroFOCCOMM.c` is now **register level and completely tick-free**:
+
+* Two bounded spin helpers, `_bus_adc_wait_clear()` and `_bus_adc_wait_isr()`, each capped at
+  `BUS_ADC_SPIN_LIMIT` (100 000) iterations, replace every tick-based wait. A missing flag
+  now costs a few milliseconds and returns `0` instead of hanging.
+* Correct register order, which the previous code got partly wrong:
+  `ADSTP` → wait for it to clear → (`ADEN`? `ADDIS` → wait) → `LL_ADC_Enable()` → wait
+  `ADRDY` → clear `ADRDY|OVR` → `LL_ADC_REG_StartConversion()` → wait `EOC` → read `DR`
+  (rank 1 = PA6/NTC) → wait `EOC` → read `DR` (rank 2 = PA7/VBUS).
+* ADC2 is **scan mode** (`NbrOfConversion = 2`, `EOC_SINGLE_CONV`, software start,
+  non-continuous), so one start produces exactly two EOCs. The old code polled once and only
+  ever consumed rank 1 — PA7 was effectively dead even when it did not hang.
+
+Because `LL_ADC_REG_StartConversion()` is used directly, the fixed conversion sequence is
+written straight into `CR`. This is required: a plain read-modify-write of `CR` would
+mis-handle the hardware-read-sensitive bits masked by `ADC_CR_BITS_PROPERTY_RS`.
+
+### Three more defects fixed at the same time
+
+| # | Defect | Effect | Fix |
+|---|---|---|---|
+| 1 | `motor_poll_send()` (`FOC/AuroFOCCOMM.c`) `return`ed silently when the requested ID did not match the local one, and only the **Position** branch ever filled `package.motor_id` | `0x30`–`0x33` replies either never arrived or carried a garbage ID byte — "detected, but every reading empty" | The function now **always** replies, zero-filling the payload on mismatch, and sets `motor_id` once right after `head` so **all five** branches are correct |
+| 2 | `poll_type` was **never cleared** — only written by the five poll setters and read by `motor_poll_send()`, which runs every 1 ms from TIM6 | One read request turned into a **1000 Hz reply flood** that starved the GUI's one-byte-at-a-time reader | `protocol_ctrl.poll_type = POLL_PACKAGE_TYPE_NONE;` right after `package_send(...)` — one request, one reply. The global is also initialised to `POLL_PACKAGE_TYPE_NONE` in its definition |
+| 3 | `package_send()`'s `usb_cdc_type` branch called `CDC_Transmit_FS(data, ...)` and **discarded the return value**, passing the shared `data[24]` global | `CDC_Transmit_FS()` silently drops the frame when USB is busy (`TxState != 0`), and `USBD_CDC_SetTxBuffer()` only stores the pointer — the USB interrupt later copies a buffer that has already been overwritten, splicing two frames together | A private `usb_cdc_tx_data[24]` staging buffer plus `memcpy()` before the call, so the frame stays intact until the USB interrupt has copied it |
+
+A duplicate `else if( send_type == can_type )` inside the `nrf24l01_type` branch of
+`package_send()` was also corrected — it repeated the CAN condition verbatim, so the branch
+could never be entered even if `SUPPORT_NRF24L01` were enabled.
+
+Separately, `gui_tabs/main_window.py` no longer does `ids = list(set(ids))` on the detected
+IDs. Set ordering put the `0xFFFF` broadcast sentinel **first** for every ID ≡ 7 (mod 8), so
+`self.motor_id` could be set to the sentinel and every subsequent command would be addressed
+to broadcast. It is now an order-preserving de-duplication with the sentinel filtered out.
+
+### What was ruled out
+
+* **Stack overflow.** `MDK-ARM/out/.../Nebula_st_mdk.axf.map` shows `Stack_Mem 0x20004d40`
+  with `5376` bytes reserved, and the build report records `Stack Usage = 1064 bytes` —
+  about 20 % used.
+* **A PA7 pin conflict.** PA6 and PA7 are configured once, as `GPIO_MODE_ANALOG` with no
+  pull, in `Core/Src/adc.c:258`.
+* **Baud-rate mismatch** between GUI and firmware.
+* **`package_init()`'s status gate** and the motor-ID byte order.
+* **The poll setters never being reached** — they are reached, and they do set `poll_type`.
+* **A GUI lock-out.** `setEnabled` is never called on the control widgets after connect.
+* **A missing `package_send()` in the bus-voltage and temperature handlers** — both always
+  reply for `func3 == 0x00`.
+
+### Still worth doing on the bench
+
+* **Rebuild before flashing.** The last build artefacts in
+  `MDK-ARM/out/Nebula_st_mdk/Nebula_st_mdk/` are timestamped 05:14, while the edited sources
+  are 18:11–18:18 — the existing `Nebula_st_mdk.bin` does **not** contain these fixes, and it
+  does not contain the RS485 fix from item 15 either.
+* **Check what the erase mode did to the calibration page.** `LR_IROM1` is
+  `0x08000000 0x00020000` (128 KB) and the calibration record lives on the last page at
+  `0x0801F800`. A **full-chip erase** wipes it, so `Pole_Pair` silently reverts from the
+  measured 14 to the default 7 and the zero offset from 55.261° to 301.464°. Prefer
+  *Erase Sectors*.
+* **Watch the raw PA7 code.** `motor_bus_voltage_param` (`0x39`) returns the raw 12-bit code
+  in `data4`, which is the quickest way to confirm the divider without a meter: at a 24 V bus
+  that word should read about 1570, and at 12 V about 785.
+* **Confirm the divider assumes the 1 kΩ is the bottom leg** (18 kΩ top, 1 kΩ bottom, gain
+  19). At a 12 V bus, PA7 should sit at ≈ 0.63 V. **If it measures near 12 V, stop and
+  disconnect immediately** — the pin would be over-volted.
+* **Re-check `Udc`.** The firmware default is 12 V but this motor (HT4310) is rated 24 V.
+* **`0x3A` and `0x3C` are dispatched by neither side** — no firmware handler is reachable and
+  no GUI control sends them.
+* **`NTC_GetTemperature()` contradicts itself:** the comment says `R33 = 2800 Ω` /
+  `R34 = 2500 Ω`, the code says `10000.0f` / `3.3f`. Left alone; there is no GUI path to
+  `0x3C` anyway.
+* **The motion limits are over-permissive for this motor:** `max_speed = 1000` against a
+  690 rpm maximum no-load speed, and `max_iq`/`max_id = 4 A` against a 1.8 A stall current.
 
 ### 5. Calibrate the board (do this once after flashing)
 
